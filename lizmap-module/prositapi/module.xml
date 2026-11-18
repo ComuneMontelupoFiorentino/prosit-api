@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module xmlns="http://jelix.org/ns/module/1.0">
+    <info id="prositapi@prosit" name="prositapi" createdate="2026-10-31">
+        <version date="2026-11-02">2.0.1</version>
+        <label lang="it_IT">Prosit API</label>
+        <label lang="en_US">Prosit API</label>
+        <description lang="it_IT">Accesso alle API Prosit (PostgREST) con l'autenticazione e i gruppi di Lizmap</description>
+        <license>Uso interno</license>
+        <creator name="Prosit"/>
+    </info>
+    <dependencies>
+        <jelix minversion="1.8.0"/>
+        <module name="jacl2db"/>
+    </dependencies>
+</module>

@@ -1,0 +1,2058 @@
+# GENERATO da bin/genera_api.py — modificare config/api.yaml
+openapi: 3.0.3
+info:
+  title: Prosit API
+  version: 2.0.0
+  description: 'API REST dei servizi Prosit (segnalazioni, videosorveglianza, manomissioni, verde, illuminazione).
+
+
+    Esposte da PostgREST tramite il modulo Lizmap prositapi. I permessi sono GRANT di PostgreSQL sui ruoli di gruppo, assegnati
+    in base ai gruppi Lizmap dell''utente.
+
+
+    **Autenticazione**: sessione Lizmap (cookie, dal browser) oppure HTTP Basic con un utente Lizmap che ha il diritto `prosit.api.programmi`
+    (Amministrazione -> Diritti). Solo HTTPS.
+
+
+    **Filtri** (sintassi PostgREST): `?colonna=eq.valore`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in.(a,b)`, `is.null`;
+    `select=a,b`, `order=data.desc`, `limit`, `offset`. Totale: `Prefer: count=exact` (intestazione `Content-Range`).
+
+
+    **Gruppi**:
+
+    - `admins`: Amministratori (Lizmap: admins)
+
+    - `tvcc`: Registro controlli videosorveglianza (Lizmap: admins, vigili, ced)
+
+    - `manutentori_verde`: Manutentori del verde (esterni e interni) (Lizmap: man_verde_es, man_int)
+
+    - `utenti`: qualunque utente Lizmap autenticato'
+  contact:
+    name: Prosit
+servers:
+- url: https://gis.comune.montelupo-fiorentino.fi.it/lizmap/api.php/prosit/v2
+security:
+- sessioneLizmap: []
+- basic: []
+tags:
+- name: stato
+- name: autenticazione
+- name: risorse
+- name: servizi
+paths:
+  /status:
+    get:
+      tags:
+      - stato
+      summary: Stato del servizio
+      security: []
+      responses:
+        '200':
+          description: Servizio funzionante
+          content:
+            application/json:
+              schema:
+                type: object
+        '503':
+          description: Servizio non disponibile
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problema'
+  /auth/me:
+    get:
+      tags:
+      - autenticazione
+      summary: Utente corrente letto da Lizmap (utente, gruppi, tipo di accesso, diritto programmi)
+      responses:
+        '200':
+          description: Utente
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': &id001
+          description: Richiesta non valida
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problema'
+        '401': &id002
+          description: Non autenticato
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problema'
+        '403': &id003
+          description: Permessi insufficienti
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problema'
+        '429': &id004
+          description: Troppe richieste
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problema'
+  /rpc/io:
+    get:
+      tags:
+      - autenticazione
+      summary: Utente, gruppi Lizmap e ruoli PostgreSQL effettivi
+      responses:
+        '200':
+          description: Profilo
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /risorse:
+    get:
+      tags:
+      - risorse
+      summary: Risorse accessibili all'utente e operazioni consentite
+      responses:
+        '200':
+          description: Elenco
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /segnalazioni:
+    get:
+      tags:
+      - risorse
+      summary: Segnalazioni (Rekla / Twproject / Prosit)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_segnalazioni'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /segnalazioni-cronologia:
+    get:
+      tags:
+      - risorse
+      summary: Aggiornamenti di stato della segnalazione (filtrare con id_prosit)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_segnalazioni_cronologia'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /segnalazioni-comunicazioni:
+    get:
+      tags:
+      - risorse
+      summary: Comunicazioni inviate per il ticket (filtrare con id_ticket)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_segnalazioni_comunicazioni'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /todo:
+    get:
+      tags:
+      - risorse
+      summary: Attivita' (ToDo Twproject) collegate al ticket (filtrare con id_segn)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_todo'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /segnalazioni-coordinate:
+    get:
+      tags:
+      - risorse
+      summary: Tema/oggetto dell'elemento segnalato (filtrare con ident)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_segnalazioni_coordinate'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /segnalazioni-allegati-rekla:
+    get:
+      tags:
+      - risorse
+      summary: Allegati Rekla (filtrare con seg_i_rek_n)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_segnalazioni_allegati_rekla'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /segnalazioni-allegati-twproject:
+    get:
+      tags:
+      - risorse
+      summary: Allegati Twproject (filtrare con id_ticket)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_segnalazioni_allegati_twproject'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /assegnatari:
+    get:
+      tags:
+      - risorse
+      summary: Elenco assegnatari (man_es -> alias_name)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_assegnatari'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /bit-ticket:
+    get:
+      tags:
+      - risorse
+      summary: Ticket edifici (vista completa)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_bit_ticket'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /bit-cronologia:
+    get:
+      tags:
+      - risorse
+      summary: Aggiornamenti ticket edifici (filtrare con id_ticket)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_bit_cronologia'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /bit-allegati:
+    get:
+      tags:
+      - risorse
+      summary: Allegati ticket edifici (filtrare con id_ticket)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_bit_allegati'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /tvcc-apparati:
+    get:
+      tags:
+      - risorse
+      summary: Telecamere con segnalazioni aperte
+      x-gruppi:
+      - tvcc
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_tvcc_apparati'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /tvcc-ticket:
+    post:
+      tags:
+      - risorse
+      summary: 'Inserimento: Nuova segnalazione dal registro TVCC (vista con trigger di inserimento)'
+      x-gruppi:
+      - tvcc
+      description: 'Colonne ammesse: seg_o_ogg, seg_o_desc, segn_ogg_gen. Impostate dal database: `seg_s_ac_op`.'
+      parameters:
+      - $ref: '#/components/parameters/prefer'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+                properties: &id005
+                  seg_o_ogg:
+                    type: string
+                    x-tipo-postgresql: character varying(255)
+                    nullable: true
+                  seg_o_desc:
+                    type: string
+                    x-tipo-postgresql: text
+                    nullable: true
+                  segn_ogg_gen:
+                    type: string
+                    x-tipo-postgresql: character varying(200)
+                    nullable: true
+                additionalProperties: false
+              - type: array
+                items:
+                  type: object
+                  properties: *id005
+                  additionalProperties: false
+      responses:
+        '201':
+          description: Creato
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /tvcc-log:
+    get:
+      tags:
+      - risorse
+      summary: Registro giornaliero dei controlli
+      x-gruppi:
+      - tvcc
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_tvcc_log'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+    post:
+      tags:
+      - risorse
+      summary: 'Inserimento: Registro giornaliero dei controlli'
+      x-gruppi:
+      - tvcc
+      description: 'Colonne ammesse: note. Impostate dal database: `insert_by`.'
+      parameters:
+      - $ref: '#/components/parameters/prefer'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+                properties: &id006
+                  note:
+                    type: string
+                    x-tipo-postgresql: text
+                    nullable: true
+                additionalProperties: false
+              - type: array
+                items:
+                  type: object
+                  properties: *id006
+                  additionalProperties: false
+      responses:
+        '201':
+          description: Creato
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /manomissioni:
+    get:
+      tags:
+      - risorse
+      summary: Scheda manomissione
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_manomissioni'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /manomissioni-allegati:
+    get:
+      tags:
+      - risorse
+      summary: Allegati della manomissione (filtrare con id_man)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_manomissioni_allegati'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /pali-luce:
+    get:
+      tags:
+      - risorse
+      summary: Scheda sostegno illuminazione
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_pali_luce'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /pali-luce-interventi:
+    get:
+      tags:
+      - risorse
+      summary: Interventi/ispezioni sul sostegno (filtrare con pl_id)
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_pali_luce_interventi'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /vp-tipi-intervento:
+    get:
+      tags:
+      - risorse
+      summary: Tipi di intervento per gruppo
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_vp_tipi_intervento'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /vp-oggetti-manutentore:
+    get:
+      tags:
+      - risorse
+      summary: Zone/oggetti per manutentore e tipo
+      x-gruppi:
+      - utenti
+      parameters:
+      - $ref: '#/components/parameters/select'
+      - $ref: '#/components/parameters/order'
+      - $ref: '#/components/parameters/limit'
+      - $ref: '#/components/parameters/offset'
+      - $ref: '#/components/parameters/prefer'
+      responses:
+        '200':
+          description: Righe
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/R_vp_oggetti_manutentore'
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /rpc/segnalazione-mail:
+    post:
+      tags:
+      - servizi
+      summary: Mette in coda la mail del ticket verso il gruppo assegnatario (utente corrente in copia)
+      x-gruppi:
+      - utenti
+      responses:
+        '200':
+          description: Risultato
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seg_id:
+                  type: integer
+  /rpc/calendario-contesto:
+    get:
+      tags:
+      - servizi
+      summary: 'Calendario verde/strade: ruolo dell''utente e configurazione'
+      x-gruppi:
+      - utenti
+      responses:
+        '200':
+          description: Risultato
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+  /rpc/calendario-interventi:
+    get:
+      tags:
+      - servizi
+      summary: 'Calendario verde/strade: interventi nel periodo, raggruppati per giorno'
+      x-gruppi:
+      - utenti
+      responses:
+        '200':
+          description: Risultato
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+      parameters:
+      - name: dal
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: al
+        in: query
+        schema:
+          type: string
+          format: date
+  /rpc/calendario-crea:
+    post:
+      tags:
+      - servizi
+      summary: 'Calendario verde/strade: nuovo intervento (con ripetizione)'
+      x-gruppi:
+      - utenti
+      responses:
+        '200':
+          description: Risultato
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tipo:
+                  type: string
+                data:
+                  type: string
+                  format: date
+                id_zona:
+                  type: integer
+                strada:
+                  type: string
+                execution:
+                  type: boolean
+                ripeti:
+                  type: object
+                  properties:
+                    fino_a:
+                      type: string
+                      format: date
+                    giorni:
+                      type: array
+                      items:
+                        type: integer
+                        minimum: 1
+                        maximum: 7
+  /rpc/calendario-modifica:
+    post:
+      tags:
+      - servizi
+      summary: 'Calendario verde/strade: modifica di un intervento'
+      x-gruppi:
+      - utenti
+      responses:
+        '200':
+          description: Risultato
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: integer
+                fonte:
+                  type: string
+                  enum:
+                  - verde
+                  - strade
+                dati:
+                  type: object
+  /rpc/calendario-elimina:
+    post:
+      tags:
+      - servizi
+      summary: 'Calendario verde/strade: cancellazione di un intervento'
+      x-gruppi:
+      - utenti
+      responses:
+        '200':
+          description: Risultato
+          content:
+            application/json:
+              schema:
+                type: object
+        '400': *id001
+        '401': *id002
+        '403': *id003
+        '429': *id004
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: integer
+                fonte:
+                  type: string
+                  enum:
+                  - verde
+                  - strade
+components:
+  securitySchemes:
+    sessioneLizmap:
+      type: apiKey
+      in: cookie
+      name: PHPSESSID
+      description: Sessione di Lizmap (browser). Le modifiche richiedono l'intestazione Origin dello stesso sito.
+    basic:
+      type: http
+      scheme: basic
+      description: Utente Lizmap con il diritto prosit.api.programmi. Solo HTTPS.
+  parameters:
+    select:
+      name: select
+      in: query
+      schema:
+        type: string
+      description: Colonne da restituire, es. `a,b`
+    order:
+      name: order
+      in: query
+      schema:
+        type: string
+      description: Ordinamento, es. `data.desc,id`
+    limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+    offset:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+    prefer:
+      name: Prefer
+      in: header
+      schema:
+        type: string
+      description: '`count=exact`, `return=representation`'
+  schemas:
+    Problema:
+      type: object
+      description: RFC 7807 Problem Details
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        codice:
+          type: string
+          description: codice PostgREST/PostgreSQL
+        request_id:
+          type: string
+      required:
+      - title
+      - status
+    R_segnalazioni:
+      type: object
+      description: Segnalazioni (Rekla / Twproject / Prosit)
+      properties:
+        seg_id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        seg_i_rek:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        seg_i_ty_cont:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_i_nc:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        seg_i_pvt_mail:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        seg_i_pvt_tel:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_i_pvt_rx:
+          type: string
+          x-tipo-postgresql: character varying(10)
+          nullable: true
+        seg_t_mat:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        seg_o_ogg:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_o_desc:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_o_img:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_o_n:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_l_ind:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_l_civ:
+          type: string
+          x-tipo-postgresql: character varying(20)
+          nullable: true
+        segn_ogg_gen:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        seg_s_ac_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        seg_s_ac_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        seg_s_ac_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_s_co_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        seg_s_co_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        seg_s_co_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_s_pr_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        seg_s_pr_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        seg_s_pr_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_s_ch_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        seg_s_ch_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        seg_s_ch_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_s_chv:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        seg_s_chv_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        seg_s_chv_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        seg_s_chv_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_i_cog:
+          type: string
+          x-tipo-postgresql: character varying(20)
+          nullable: true
+        segn_s_ass_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        segn_s_ass_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        segn_s_ass_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        segn_s_prog_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        segn_s_prog_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        segn_s_prog_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        segn_s_prob_d:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        segn_s_prob_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        segn_s_prob_n:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        segn_s_com:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        ident:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        x:
+          type: number
+          x-tipo-postgresql: double precision
+          nullable: true
+        y:
+          type: number
+          x-tipo-postgresql: double precision
+          nullable: true
+        stato_segn:
+          type: string
+          x-tipo-postgresql: character varying(40)
+          nullable: true
+        op_gen:
+          type: string
+          x-tipo-postgresql: character(50)
+          nullable: true
+        date_gen:
+          type: string
+          x-tipo-postgresql: character varying(10)
+          nullable: true
+        note_gen:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        additional_fields:
+          x-tipo-postgresql: jsonb
+          nullable: true
+        seg_i_rek_n:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        office_manager:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_i_rek_alias:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        send_to_man_es:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        man_es:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        update_date:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+        high_complexity:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        note_maintainer:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        long_term_works_ty:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        aborted:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        isfrom:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        is_father:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        is_child:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        insert_timestamp:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+    R_segnalazioni_cronologia:
+      type: object
+      description: Aggiornamenti di stato della segnalazione (filtrare con id_prosit)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        action_description:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        action_user:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        action_date:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        id_ticket:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        deleted_at:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+        id_prosit:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        is_from:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        action_ty:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        status:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        error_desc:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        error_fields:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        id_pk:
+          type: integer
+          x-tipo-postgresql: bigint
+          nullable: true
+    R_segnalazioni_comunicazioni:
+      type: object
+      description: Comunicazioni inviate per il ticket (filtrare con id_ticket)
+      properties:
+        type:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        status_desc:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        status_ty:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        subject:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        timing:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp without time zone
+          nullable: true
+        id_ticket:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        link_twprj:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+    R_todo:
+      type: object
+      description: Attivita' (ToDo Twproject) collegate al ticket (filtrare con id_segn)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        user_to_assign:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        id_segn:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        subject:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        body:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        task_id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        gravity:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        assigned_by:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        status:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp without time zone
+          nullable: true
+        sent_at:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp without time zone
+          nullable: true
+        lat:
+          type: number
+          x-tipo-postgresql: double precision
+          nullable: true
+        lon:
+          type: number
+          x-tipo-postgresql: double precision
+          nullable: true
+        assignee_id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        id_todo_twprj:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        todo_status_twprj:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        todo_comments_twprj:
+          x-tipo-postgresql: json
+          nullable: true
+        sinc_status:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp without time zone
+          nullable: true
+        insert_by_app:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+    R_segnalazioni_coordinate:
+      type: object
+      description: Tema/oggetto dell'elemento segnalato (filtrare con ident)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        ident:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        coord_x:
+          type: number
+          x-tipo-postgresql: double precision
+          nullable: true
+        coord_y:
+          type: number
+          x-tipo-postgresql: double precision
+          nullable: true
+        tema:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        oggetto_spec:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+    R_segnalazioni_allegati_rekla:
+      type: object
+      description: Allegati Rekla (filtrare con seg_i_rek_n)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        seg_i_rek_n:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        doc_id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        path_doc:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        id_prosit:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+    R_segnalazioni_allegati_twproject:
+      type: object
+      description: Allegati Twproject (filtrare con id_ticket)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        id_ticket:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        url:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        file_name:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        date_insert:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+    R_assegnatari:
+      type: object
+      description: Elenco assegnatari (man_es -> alias_name)
+      properties:
+        man_es:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        alias_name:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+    R_bit_ticket:
+      type: object
+      description: Ticket edifici (vista completa)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        id_alias:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        entry_date:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        detailed_name:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        issue_subject:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        issue_description:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        organization_name:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        issue_priority:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        detail_status:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        status:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        status_description:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        class_front_end:
+          type: string
+          x-tipo-postgresql: character varying(150)
+          nullable: true
+        description_detailed_status:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        new_comment:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        new_action_user:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        change_stato:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        new_status_over_seq:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        assignee_manteinance:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+        id_buildings:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        full_name:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        geom:
+          type: string
+          description: 'geometria (EWKB esadecimale; GeoJSON con Accept: application/geo+json)'
+          x-tipo-postgresql: geometry(Point,6707)
+          nullable: true
+    R_bit_cronologia:
+      type: object
+      description: Aggiornamenti ticket edifici (filtrare con id_ticket)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        action_description:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        action_user:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        action_date:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        action_note:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        id_ticket:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+    R_bit_allegati:
+      type: object
+      description: Allegati ticket edifici (filtrare con id_ticket)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        doc_url:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        doc_name:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        id_ticket:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+    R_tvcc_apparati:
+      type: object
+      description: Telecamere con segnalazioni aperte
+      properties:
+        id_app:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+        reported:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        num_reported:
+          type: integer
+          x-tipo-postgresql: bigint
+          nullable: true
+        issues:
+          type: array
+          items: &id007 {}
+          x-tipo-postgresql: text[]
+          nullable: true
+        lett_targh:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+        stati:
+          type: array
+          items: *id007
+          x-tipo-postgresql: character varying[]
+          nullable: true
+    R_tvcc_ticket:
+      type: object
+      description: Nuova segnalazione dal registro TVCC (vista con trigger di inserimento)
+      properties:
+        seg_id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        seg_s_ac_op:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        office_manager:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_o_ogg:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        seg_o_desc:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        seg_t_mat:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        segn_ogg_gen:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        sended_by:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+    R_tvcc_log:
+      type: object
+      description: Registro giornaliero dei controlli
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        day_log:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+        note:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        tlc_errors:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        insert_by:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+    R_manomissioni:
+      type: object
+      description: Scheda manomissione
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        ente:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        descr_int:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        data_start:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        data_finish:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        internal_contacts_yard:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        external_contacts_yard:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        internal_technical:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        external_technical:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        doc1:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        doc2:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        traffic_impact:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        traffic_impact_description:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        ended:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        ubi:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        data_insert:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+        uuid_request:
+          type: string
+          x-tipo-postgresql: character varying(150)
+          nullable: true
+        user_insert:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        stato:
+          type: string
+          x-tipo-postgresql: character varying(250)
+          nullable: true
+        insert_canal:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        external_contacts_name:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        external_contacts_surname:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        external_contacts_pos:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        external_contacts_pnumber:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        external_contacts_mail:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        external_contacts_pec:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        ty_emissions:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        protocollo_num:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        is_linked_twprj:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        task_twprj:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        disciplinare:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        last_update:
+          type: string
+          format: date-time
+          x-tipo-postgresql: timestamp with time zone
+          nullable: true
+        full_body:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        mail_cc:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        mail_to:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        sp_address:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        legal_address_city:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        legal_address_street:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        execute_work_by:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        external_executer_work:
+          x-tipo-postgresql: jsonb
+          nullable: true
+        generic_auth:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        num_authorization:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        precision_location:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        figure_responsabili:
+          x-tipo-postgresql: jsonb
+          nullable: true
+        garanzia_tipo:
+          type: string
+          x-tipo-postgresql: character varying(255)
+          nullable: true
+        is_public_utility:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        tipologia_gestore:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+        checked:
+          type: boolean
+          x-tipo-postgresql: boolean
+          nullable: true
+        check_by:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        check_result:
+          x-tipo-postgresql: jsonb
+          nullable: true
+        id_issue_twprj:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+    R_manomissioni_allegati:
+      type: object
+      description: Allegati della manomissione (filtrare con id_man)
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        id_man:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        url_path:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        title_attach:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        id_doc_twprj:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+    R_pali_luce:
+      type: object
+      description: Scheda sostegno illuminazione
+      properties:
+        pl_id:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+        num_punti_luce:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        pl_is_arm:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        pl_is_alt:
+          type: string
+          x-tipo-postgresql: character varying(20)
+          nullable: true
+        pl_is_sos:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        pl_is_for:
+          type: string
+          x-tipo-postgresql: character varying(50)
+          nullable: true
+        pl_is_mat:
+          type: string
+          x-tipo-postgresql: character varying(20)
+          nullable: true
+        pl_is_tilt:
+          type: number
+          x-tipo-postgresql: real
+          nullable: true
+        pl_is_car:
+          type: number
+          x-tipo-postgresql: real
+          nullable: true
+        pl_is_bra:
+          type: number
+          x-tipo-postgresql: real
+          nullable: true
+        pl_is_age:
+          type: string
+          x-tipo-postgresql: character varying(20)
+          nullable: true
+        pl_is_sts:
+          type: string
+          x-tipo-postgresql: character varying(40)
+          nullable: true
+        pl_is_ele:
+          type: string
+          x-tipo-postgresql: character varying(40)
+          nullable: true
+        pl_is_aep:
+          type: string
+          x-tipo-postgresql: character varying(15)
+          nullable: true
+    R_pali_luce_interventi:
+      type: object
+      description: Interventi/ispezioni sul sostegno (filtrare con pl_id)
+      properties:
+        pl_id:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+        data_int:
+          type: string
+          format: date
+          x-tipo-postgresql: date
+          nullable: true
+        ty_int:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+    R_vp_tipi_intervento:
+      type: object
+      description: Tipi di intervento per gruppo
+      properties:
+        int_name:
+          type: string
+          x-tipo-postgresql: character varying(200)
+          nullable: true
+        usergroup:
+          type: string
+          x-tipo-postgresql: character varying(100)
+          nullable: true
+    R_vp_oggetti_manutentore:
+      type: object
+      description: Zone/oggetti per manutentore e tipo
+      properties:
+        id:
+          type: integer
+          x-tipo-postgresql: integer
+          nullable: true
+        name_obj:
+          type: string
+          x-tipo-postgresql: character varying
+          nullable: true
+        maintainer:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true
+        int_ty:
+          type: string
+          x-tipo-postgresql: text
+          nullable: true

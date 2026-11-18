@@ -1,0 +1,9 @@
+# segreti e configurazione della macchina: stanno in /etc/prosit-api, mai qui
+/etc/*
+!/etc/*.esempio
+*.env
+*.jwk
+*.pem
+*.key
+*.log
+*.bak*

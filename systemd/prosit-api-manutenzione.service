@@ -1,0 +1,13 @@
+# Prosit API v2 — backup e pulizia settimanali (avviato da prosit-api-manutenzione.timer)
+[Unit]
+Description=Prosit API v2 - backup e pulizia
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# l'utente che gestisce la Prosit API: usa il suo ~/.pgpass e scrive in /var/backups/prosit-api
+User=@UTENTE@
+Group=@GRUPPO@
+ExecStart=@RADICE@/bin/prosit-api manutenzione
+NoNewPrivileges=yes
+PrivateTmp=yes

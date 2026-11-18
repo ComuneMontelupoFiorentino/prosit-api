@@ -1,0 +1,33 @@
+;<?php die(''); ?>
+; =============================================================================
+; Prosit API v2 - configurazione del modulo Lizmap "prositapi"
+; Percorso: /etc/prosit-api/prositapi.ini.php   permessi 0640 <utente>:www-data
+; Lo scrive "prosit-api installa"; FUORI dalla cartella di Lizmap, quindi gli
+; aggiornamenti di Lizmap non lo toccano. Le righe commentate hanno gia' il valore
+; predefinito indicato.
+; =============================================================================
+
+; --- PostgREST (solo in locale) ---
+;postgrest = "http://127.0.0.1:3100"
+;postgrest_admin = "http://127.0.0.1:3101"
+
+; --- token interno modulo -> PostgREST (RS256, firmato con firebase/php-jwt) ---
+jwt_privata = "/etc/prosit-api/jwt-privata.pem"
+;jwt_kid = "prosit-lz-1"
+;audience = "prosit-api"
+;durata_token = 60
+; libreria firebase/php-jwt caricata via FTP: la cartella "src" del rilascio
+;php_jwt = "/opt/prosit-api/lib/php-jwt/src"
+
+; --- database "api": utente che allinea utenti/gruppi Lizmap ai ruoli PostgreSQL ---
+;db_host = "127.0.0.1"
+;db_porta = 5432
+;db_utente = "api_gateway"
+db_password = "CAMBIARE"
+
+; --- sicurezza ---
+; Basic auth (utenti tecnici) solo su HTTPS; false SOLO per prove in locale
+;richiedi_https = true
+; siti autorizzati a fare POST/PATCH/DELETE con la sessione del browser, oltre a Lizmap stesso
+;origini_consentite[] = "https://prosit.comune.example"
+;corpo_massimo = 1048576

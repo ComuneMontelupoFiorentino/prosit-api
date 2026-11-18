@@ -1,0 +1,11 @@
+# Prosit API v2 — ogni domenica alle 3:17 (recupera al riavvio se la VM era spenta)
+[Unit]
+Description=Prosit API v2 - manutenzione settimanale
+
+[Timer]
+OnCalendar=Sun *-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

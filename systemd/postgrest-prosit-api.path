@@ -1,0 +1,11 @@
+# Prosit API v2 — avvia PostgREST appena "prosit-api installa" ha scritto la configurazione.
+# Cosi' l'amministratore installa e abilita tutto in una volta sola, anche prima dell'installazione.
+[Unit]
+Description=Prosit API v2 - avvio di PostgREST quando la configurazione e' pronta
+
+[Path]
+PathExists=@ETC@/postgrest.env
+Unit=postgrest-prosit-api.service
+
+[Install]
+WantedBy=multi-user.target

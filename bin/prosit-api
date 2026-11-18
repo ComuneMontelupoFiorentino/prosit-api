@@ -1,0 +1,1002 @@
+#!/usr/bin/env bash
+# =============================================================================
+# PROSIT API v2 — installazione e manutenzione. Si lancia con il PROPRIO utente
+# (niente sudo), sulla VM di Lizmap. PostgREST gira come servizio systemd, installato
+# una volta dall'amministratore della VM (vedi README §3).
+#
+#   prosit-api installa         installazione (rilanciabile, non rigenera i segreti). Se
+#                               /etc/prosit-api non c'e' ancora fa tutto quello che si puo'
+#                               senza root e prepara lo script per l'amministratore.
+#   prosit-api applica          dopo ogni modifica di config/api.yaml o sql/6x_*.sql
+#   prosit-api lizmap           (re)installa il modulo in Lizmap: DA LANCIARE DOPO OGNI
+#                               AGGIORNAMENTO DI LIZMAP (rilanciabile, non fa danni)
+#   prosit-api rimuovi-modulo   toglie il modulo da Lizmap in modo pulito
+#   prosit-api utenti-pg        utenti/gruppi/diritti e registro di Lizmap da SQLite a PostgreSQL
+#                               (database "lizmap"); utenti-sqlite per tornare indietro
+#   prosit-api verifica         controlli di sicurezza e di funzionamento
+#   prosit-api systemd          scrive le unita' systemd da consegnare all'amministratore
+#   prosit-api postgrest stato|ricarica|riavvia
+#   prosit-api manutenzione     backup + pulizia (lo lancia il timer systemd la domenica)
+#   prosit-api backup           segreti + database "api" e "lizmap" in /var/backups/prosit-api
+#   prosit-api ruota-jwt        nuova coppia di chiavi del token interno (nessun disservizio)
+#   prosit-api pulizia [A] [U]  audit piu' vecchio di A giorni (365), utenti inattivi da U (180)
+#
+# Cartelle (standard Linux, FHS):
+#   /opt/prosit-api                  questo pacchetto (software)
+#   /opt/prosit-api/lib/php-jwt/src  firebase/php-jwt 7.2.1 (inclusa nel pacchetto)
+#   /etc/prosit-api                  segreti e configurazione (MAI nel pacchetto)
+#   /usr/local/bin/prosit/postgrest  binario di PostgREST (o collegamento a postgrest-vXX)
+#   /var/backups/prosit-api          backup
+#   log di PostgREST                 journalctl -u postgrest-prosit-api
+# Impostazioni (LIZMAP_DIR, LIZMAP_URL, PG_PORTA, ...): /etc/prosit-api/impostazioni.env
+# Accesso a PostgreSQL come superuser: ~/.pgpass (vedi README).
+# =============================================================================
+set -euo pipefail
+umask 077
+
+RADICE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+ETC=${PROSIT_API_ETC:-/etc/prosit-api}          # percorso definitivo (scritto nei file di configurazione)
+# Finche' l'amministratore non ha creato $ETC si lavora in "preparazione": i file si scrivono in
+# una cartella provvisoria della home, gia' con i percorsi definitivi dentro, e l'amministratore
+# li copia al loro posto con lo script per-amministratore.sh (un solo intervento, alla fine).
+if [ -d "$ETC" ] && [ -w "$ETC" ]; then
+  PREP=0; CONF=$ETC; DIR_FINALE=$RADICE
+else
+  PREP=1; CONF=${PROSIT_API_PREP:-$HOME/prosit-api-config}; DIR_FINALE=${PROSIT_API_DIR:-/opt/prosit-api}
+fi
+# impostazioni salvate all'installazione (valgono anche per il timer); le variabili d'ambiente vincono
+if [ -r "$CONF/impostazioni.env" ]; then
+  while IFS='=' read -r k v; do
+    [[ $k =~ ^[A-Z_]+$ ]] && [ -z "${!k:-}" ] && export "$k=$v"
+  done < "$CONF/impostazioni.env"
+fi
+WEB_USER=${WEB_USER:-www-data}
+WEB_GROUP=${WEB_GROUP:-$WEB_USER}
+PGRST_DIR=${PGRST_DIR:-/usr/local/bin/prosit}
+PGRST_BIN=$PGRST_DIR/postgrest          # percorso fisso, usato dall'unita' systemd
+SERVIZIO=postgrest-prosit-api
+PHP_JWT=${PHP_JWT:-$RADICE/lib/php-jwt/src}    # dove si trova ora (per i controlli)
+BACKUP_DIR=${BACKUP_DIR:-/var/backups/prosit-api}
+LIZMAP_URL=${LIZMAP_URL:-http://127.0.0.1/lizmap}
+PG_HOST=${PG_HOST:-127.0.0.1}
+PG_PORTA=${PG_PORTA:-5432}
+PG_ADMIN=${PG_ADMIN:-postgres}
+MODULO=prositapi
+FDW_BASE_RO=${FDW_BASE_RO:-prosit_ro}      # ruoli esistenti di cui prosit_api_ro/rw ereditano i permessi
+FDW_BASE_RW=${FDW_BASE_RW:-prosit_rw}
+PSQL=(psql -X -q -v ON_ERROR_STOP=1 -h "$PG_HOST" -p "$PG_PORTA" -U "$PG_ADMIN" -w)
+
+info(){ printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok(){ printf '\033[32m OK\033[0m %s\n' "$*"; }
+avviso(){ printf '\033[33m !!\033[0m %s\n' "$*"; }
+errore(){ printf '\033[31mERR\033[0m %s\n' "$*" >&2; exit 1; }
+casuale(){ openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c "${1:-40}"; }
+
+[ "$(id -u)" -ne 0 ] || avviso "lanciato da root: i file saranno di root. Previsto l'uso con il proprio utente."
+
+# ------------------------------------------------------------------ permessi
+# rende un file leggibile da Apache/PHP ma non dagli altri utenti della VM
+leggibile_web(){
+  chmod 0600 "$1"
+  [ "$PREP" = 1 ] && return 0     # i permessi definitivi li mette per-amministratore.sh
+  if chgrp "$WEB_GROUP" "$1" 2>/dev/null; then chmod 0640 "$1"; return; fi
+  if command -v setfacl >/dev/null && setfacl -m "u:$WEB_USER:r" "$1" 2>/dev/null; then return; fi
+  chmod 0644 "$1"
+  avviso "$1 e' leggibile da tutti gli utenti della VM: chiedere all'amministratore di aggiungere $(id -un) al gruppo $WEB_GROUP (oppure installare 'acl')"
+}
+# vero se l'utente web puo' scrivere il file/cartella (proprietario, gruppo, altri o ACL)
+web_scrive(){
+  local u g m; read -r u g m < <(stat -c '%U %G %a' "$1")
+  m=$((8#$m))
+  { [ "$u" = "$WEB_USER" ] && (( m & 0200 )); } || { [ "$g" = "$WEB_GROUP" ] && (( m & 0020 )); } || (( m & 0002 )) \
+    || { command -v getfacl >/dev/null && getfacl -cp "$1" 2>/dev/null | grep -Eq "^(user:$WEB_USER|group:$WEB_GROUP):.w"; }
+}
+web_legge(){
+  local u g m; read -r u g m < <(stat -c '%U %G %a' "$1")
+  m=$((8#$m))
+  { [ "$u" = "$WEB_USER" ] && (( m & 0400 )); } || { [ "$g" = "$WEB_GROUP" ] && (( m & 0040 )); } || (( m & 0004 )) \
+    || { command -v getfacl >/dev/null && getfacl -cp "$1" 2>/dev/null | grep -Eq "^(user:$WEB_USER|group:$WEB_GROUP):r"; }
+}
+
+# ------------------------------------------------------------------ Lizmap
+# Cartella "lizmap" di Lizmap Web Client. Prima scelta: quella che Apache pubblica davvero
+# (Alias /lizmap .../lizmap/www nei siti abilitati), cosi' dopo un aggiornamento con cartella
+# nuova (lizmap-web-client-3.9.13) si segue Apache e non una cartella vecchia.
+lizmap_apache(){
+  local f
+  for f in /etc/apache2/sites-enabled/*.conf /etc/httpd/conf.d/*.conf; do
+    [ -r "$f" ] || continue
+    awk 'tolower($1)=="alias" && $2 ~ "^/lizmap/?$" {print $3}' "$f"
+  done 2>/dev/null | sed 's|/www/*$||' | sort -u
+}
+lizmap_dir(){
+  local d candidati=()
+  if [ -n "${LIZMAP_DIR:-}" ]; then candidati=("$LIZMAP_DIR")
+  else
+    mapfile -t candidati < <(lizmap_apache)
+    candidati+=(/var/www/lizmap-web-client/lizmap /var/www/lizmap/lizmap /var/www/html/lizmap/lizmap)
+  fi
+  for d in "${candidati[@]}"; do
+    [ -n "$d" ] && [ -f "$d/install/installer.php" ] && [ -f "$d/www/api.php" ] && { echo "$d"; return; }
+  done
+  errore "Lizmap non trovato: indicare la cartella con LIZMAP_DIR=/var/www/.../lizmap"
+}
+
+# file che l'installer di Lizmap deve poter scrivere quando lo lancia il nostro utente
+controlla_scrittura_lizmap(){
+  local L=$1 f manca=()
+  for f in "$L/lizmap-modules" "$L/var/config" "$L/var/config/localconfig.ini.php" "$L/var/config/installer.ini.php" \
+           "$L/var/config/localurls.xml" "$L/var/db" "$L/var/db/jauth.db" "$L/../temp/lizmap"; do
+    [ -e "$f" ] || continue
+    [ -w "$f" ] || manca+=("$f")
+  done
+  [ ${#manca[@]} -eq 0 ] && return
+  printf '   %s\n' "${manca[@]}" >&2
+  errore "l'utente $(id -un) non puo' scrivere questi file di Lizmap, quindi non puo' lanciare l'installer.
+    Una sola volta, l'amministratore della VM:
+      usermod -aG $WEB_GROUP $(id -un)
+      chmod -R g+w $L/lizmap-modules $L/var/config $L/var/db $(readlink -f "$L/../temp")/lizmap
+    (poi uscire e rientrare da SSH). Nessun file di Lizmap e' stato modificato."
+}
+
+# dopo l'installer: come install/set_rights.sh di Lizmap, ma senza root. Le cartelle che
+# Apache deve scrivere (stesso elenco di set_rights.sh): i file del nostro utente passano al
+# gruppo di Apache e diventano scrivibili dal gruppo. Ripara anche un restore.sh fatto senza root.
+sistema_permessi_lizmap(){
+  local L=$1 d dirs=()
+  for d in var/config var/db var/log var/themes var/overloads var/mails var/uploads var/lizmap-theme-config \
+           ../temp/lizmap www/cache www/document www/live; do
+    [ -e "$L/$d" ] && dirs+=("$L/$d")
+  done
+  if id -Gn | tr ' ' '\n' | grep -qx "$WEB_GROUP"; then
+    find "${dirs[@]}" -user "$(id -u)" -exec chgrp "$WEB_GROUP" {} + -exec chmod g+w {} + 2>/dev/null || true
+  elif command -v setfacl >/dev/null; then
+    # non nel gruppo di Apache: permessi con ACL (come gia' usato sulla VM)
+    find "${dirs[@]}" -user "$(id -u)" -exec setfacl -m "u:$WEB_USER:rwX" {} + 2>/dev/null || true
+  fi
+  local f male=()
+  for f in "$L/var/config" "$L/var/config/localconfig.ini.php" "$L/var/config/localurls.xml" "$L/var/db" "$L/var/db/jauth.db" \
+           "$L/var/log" "$L/../temp/lizmap" "$L/www/cache"; do
+    [ -e "$f" ] || continue
+    web_scrive "$f" || male+=("$f")
+  done
+  if [ ${#male[@]} -gt 0 ]; then
+    printf '   %s\n' "${male[@]}"
+    avviso "Apache ($WEB_USER) non puo' scrivere questi file: il pannello di amministrazione di Lizmap non salverebbe.
+    L'amministratore della VM: chown $WEB_USER:$WEB_GROUP <file> && chmod g+w <file>"
+  else
+    ok "permessi di Lizmap corretti (scrivibili da $WEB_USER)"
+  fi
+}
+
+# installer ufficiale di Lizmap. Se non riesce a svuotare la cache (file creati da Apache) lo
+# segnala: ci pensa subito dopo pulisci_cache_lizmap, quindi qui e' solo un'informazione.
+installer_lizmap(){
+  local out; out=$(php "$1/install/installer.php" 2>&1) || { echo "$out" | tail -n 20; errore "installer di Lizmap non riuscito"; }
+  grep -qi 'aborted\|\[error\]' <<<"$out" && { echo "$out" | tail -n 20; errore "installer di Lizmap interrotto"; }
+  grep -q 'Installation is finished\|installed or upgraded' <<<"$out" && ok "installer di Lizmap completato"
+  grep -q 'temp directory cannot be removed' <<<"$out" && ok "(la cache non svuotata dall'installer la svuota prosit-api qui sotto)"
+  return 0
+}
+
+# Svuota la cache compilata di Lizmap (temp/lizmap), come install/clean_vartmp.sh ma senza
+# toccare i log e funzionando anche sui file creati da Apache (www-data, cartelle 755) che il
+# nostro utente non puo' cancellare: le cartelle si possono pero' RINOMINARE (la cartella madre
+# e' scrivibile dal gruppo), e Jelix ricompila da zero. Gli avanzi .vecchio-* sono innocui e si
+# cancellano quando possibile.
+pulisci_cache_lizmap(){
+  local T d resto
+  T=$(cd "$1/../temp/lizmap" 2>/dev/null && pwd) || return 0
+  for d in "$T"/*; do
+    [ -e "$d" ] || continue
+    rm -rf "$d" 2>/dev/null || mv "$d" "$T/.vecchio-$(date +%Y%m%d%H%M%S)-$RANDOM-$(basename "$d")" 2>/dev/null || true
+  done
+  rm -rf "$T"/.vecchio-* 2>/dev/null || true
+  resto=$(find "$T" -mindepth 1 -maxdepth 1 ! -name '.*' | head -3)
+  [ -z "$resto" ] && ok "cache di Lizmap svuotata" \
+    || avviso "cache di Lizmap non svuotata del tutto ($resto): l'amministratore puo' cancellare $T/*"
+}
+
+controlla_lizmap(){
+  local c
+  # -k: certificato autofirmato accettato SOLO per questa prova locale
+  c=$(curl -sk -o /dev/null -w '%{http_code}' "$LIZMAP_URL/index.php" || true)
+  [ "$c" = "200" ] && ok "Lizmap risponde ($LIZMAP_URL)" || avviso "Lizmap ha risposto $c su $LIZMAP_URL/index.php (LIZMAP_URL in impostazioni.env se l'indirizzo e' diverso)"
+  c=$(curl -sk "$LIZMAP_URL/api.php/prosit/v2/status" || true)
+  if grep -q '"stato":"ok"' <<<"$c"; then ok "API v2: $c"
+  elif [ "$PREP" = 1 ]; then ok "API v2 raggiungibile in Lizmap; rispondera' dopo l'intervento dell'amministratore (ora: ${c:0:80})"
+  else avviso "API v2 /status non risponde come atteso: ${c:0:200}"; fi
+}
+
+# (Re)installa il modulo: COPIATO in lizmap/lizmap-modules (conservata da backup.sh/restore.sh)
+lizmap(){
+  local L; L=$(lizmap_dir)
+  info "Modulo $MODULO in $L"
+  [ -s "$CONF/prositapi.ini.php" ] || config_modulo
+  controlla_php_jwt
+  controlla_scrittura_lizmap "$L"
+  umask 002
+  local tmp="$L/lizmap-modules/.$MODULO.nuovo"
+  rm -rf "$tmp"; cp -r "$RADICE/lizmap-module/$MODULO" "$tmp"
+  chmod -R a+rX,go-w "$tmp"
+  rm -rf "${L:?}/lizmap-modules/$MODULO"; mv "$tmp" "$L/lizmap-modules/$MODULO"
+  ok "copiato in lizmap-modules/$MODULO (versione $(grep -oP '(?<=<version date="[^"]{10}">)[^<]+' "$L/lizmap-modules/$MODULO/module.xml"))"
+  php "$L/install/configurator.php" -n "$MODULO" >/dev/null || errore "configurazione del modulo non riuscita"
+  ok "modulo attivato, URL /api.php/prosit/v2 registrate (var/config/localurls.xml)"
+  installer_lizmap "$L"
+  pulisci_cache_lizmap "$L"
+  sistema_permessi_lizmap "$L"
+  umask 077
+  ok "diritto 'Accesso alle API da programmi' disponibile in Amministrazione -> Diritti"
+  controlla_lizmap
+}
+
+rimuovi_modulo(){
+  local L; L=$(lizmap_dir)
+  info "Rimozione del modulo $MODULO da $L"
+  controlla_scrittura_lizmap "$L"
+  umask 002
+  if [ -d "$L/lizmap-modules/$MODULO" ]; then
+    php "$L/install/configurator.php" -n -r "$MODULO" >/dev/null || errore "disattivazione non riuscita: modulo NON rimosso"
+    installer_lizmap "$L"
+    rm -rf "${L:?}/lizmap-modules/$MODULO"
+  fi
+  grep -q "$MODULO" "$L/var/config/localurls.xml" 2>/dev/null && errore "localurls.xml cita ancora $MODULO: non cancellare la cartella del modulo"
+  pulisci_cache_lizmap "$L"
+  sistema_permessi_lizmap "$L"
+  ok "modulo rimosso (Lizmap continua a funzionare; le API v2 non rispondono piu')"
+}
+
+# ------------------------------------------------------------------ controlli
+controlla_php_jwt(){
+  [ -f "$PHP_JWT/JWT.php" ] || errore "libreria firebase/php-jwt non trovata in $PHP_JWT.
+    E' inclusa nel pacchetto (lib/php-jwt): ricopiare il pacchetto completo. Per un'altra versione:
+    la cartella 'src' di un rilascio v7.x di https://github.com/firebase/php-jwt/releases in $PHP_JWT."
+  grep -q 'public static function encode' "$PHP_JWT/JWT.php" || errore "$PHP_JWT/JWT.php non sembra firebase/php-jwt"
+  web_legge "$PHP_JWT/JWT.php" || errore "$PHP_JWT non e' leggibile da $WEB_USER (chmod -R a+rX $(dirname "$PHP_JWT"))"
+  ok "firebase/php-jwt in $PHP_JWT"
+}
+
+controlli(){
+  info "Controlli"
+  for c in psql pg_dump php python3 openssl curl; do command -v $c >/dev/null || errore "comando non trovato: $c"; done
+  php -r 'exit(version_compare(PHP_VERSION, "8.1", ">=") ? 0 : 1);' || errore "serve PHP >= 8.1"
+  for e in pgsql curl openssl json mbstring; do php -m | grep -qi "^$e$" || errore "estensione PHP mancante: $e"; done
+  python3 -c 'import yaml' 2>/dev/null || errore "manca il modulo python3-yaml (chiedere all'amministratore: apt install python3-yaml)"
+  local s
+  s=$("${PSQL[@]}" -d postgres -At -c "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1) \
+    || errore "PostgreSQL non raggiungibile come $PG_ADMIN su $PG_HOST:$PG_PORTA: $s
+    Creare ~/.pgpass (chmod 600) con la riga:  $PG_HOST:$PG_PORTA:*:$PG_ADMIN:<password>"
+  [ "$s" = "t" ] || errore "$PG_ADMIN non e' superuser di PostgreSQL (serve per creare ruoli, database e postgres_fdw)"
+  s=$("${PSQL[@]}" -d postgres -At -c 'SHOW server_version_num')
+  [ "$s" -ge 160000 ] || errore "serve PostgreSQL >= 16 (trovato $s)"
+  ok "PostgreSQL $s, superuser $PG_ADMIN"
+  binario_postgrest
+  controlla_php_jwt
+  ok "Lizmap in $(lizmap_dir)"
+}
+
+# ------------------------------------------------------------------ segreti e configurazione
+# le cartelle definitive le crea l'amministratore (per-amministratore.sh); in preparazione si
+# usa una cartella provvisoria nella home, leggibile solo dall'utente
+cartelle(){
+  if [ "$PREP" = 1 ]; then
+    install -d -m 0700 "$CONF"
+    ok "preparazione: configurazione provvisoria in $CONF (la copiera' l'amministratore in $ETC)"
+    return
+  fi
+  [ -w "$RADICE" ] || errore "$RADICE non scrivibile da $(id -un)"
+  # 0711: Apache (configurazione del modulo) e PostgREST (chiave pubblica) attraversano la
+  # cartella senza poterla elencare; ogni file ha i suoi permessi
+  chmod 0711 "$ETC" 2>/dev/null || true
+}
+
+# PostgREST: percorso fisso /usr/local/bin/prosit/postgrest. Se c'e' solo un file versionato
+# (postgrest-v16.5) crea il collegamento: per aggiornare basta cambiare il collegamento.
+binario_postgrest(){
+  if [ ! -x "$PGRST_BIN" ] || [ -d "$PGRST_BIN" ] || ! "$PGRST_BIN" --version >/dev/null 2>&1; then
+    # il binario puo' stare anche in una sottocartella, es. postgrest-16.5/postgrest
+    local f trovato="" visti=()
+    while IFS= read -r f; do
+      [ -d "$f" ] && continue
+      case "$f" in *.tar*|*.zip|*.sh|*.conf|*.md|*.txt|*.yaml|*.yml|*.service|*.sql|*.env) continue ;; esac
+      if [ ! -x "$f" ]; then visti+=("$f: non eseguibile (chmod 755 $f)"); continue; fi
+      if "$f" --version 2>/dev/null | grep -qi postgrest; then trovato=$f; break; fi
+      visti+=("$f: non risponde a --version come PostgREST")
+    done < <(find "$PGRST_DIR" -maxdepth 4 \( -type f -o -type l \) -iname 'postgrest*' ! -path "$PGRST_BIN" 2>/dev/null | sort -rV)
+    if [ -n "$trovato" ]; then
+      [ -L "$PGRST_BIN" ] && rm -f "$PGRST_BIN"
+      [ -e "$PGRST_BIN" ] && errore "$PGRST_BIN esiste ma non e' il binario di PostgREST: spostarlo"
+      ln -s "${trovato#$PGRST_DIR/}" "$PGRST_BIN"; ok "collegamento $PGRST_BIN -> ${trovato#$PGRST_DIR/}"
+    else
+      [ ${#visti[@]} -gt 0 ] && printf '   %s\n' "${visti[@]}" >&2
+      errore "PostgREST non trovato in $PGRST_DIR (cercato fino a 4 livelli: file chiamati postgrest*).
+    Il binario si ottiene da https://github.com/PostgREST/postgrest/releases (postgrest-vXX-linux-static-x86-64.tar.xz):
+    estrarlo (tar -xJf ...) in una cartella sotto $PGRST_DIR e: chmod 755 <file postgrest>"
+    fi
+  fi
+  ok "$("$PGRST_BIN" --version 2>/dev/null | head -1) ($PGRST_BIN)"
+}
+
+segreti(){
+  info "Segreti in $CONF"
+  if [ ! -f "$CONF/segreti.env" ]; then
+    {
+      echo "# Prosit API v2 — segreti (0600). Non versionare, non copiare in chiaro."
+      echo "AUTHENTICATOR_PASS=$(casuale 40)"
+      echo "GATEWAY_PASS=$(casuale 40)"
+      echo "# Utenti dei collegamenti tra database (sql/05_utenti_fdw.sql): password generate"
+      echo "PW_PROSIT_API_RO=$(casuale 40)"
+      echo "PW_PROSIT_API_RW=$(casuale 40)"
+    } > "$CONF/segreti.env.nuovo"
+    chmod 0600 "$CONF/segreti.env.nuovo"; mv "$CONF/segreti.env.nuovo" "$CONF/segreti.env"
+    ok "creato segreti.env"
+  else
+    ok "segreti.env gia' presente (non modificato)"
+  fi
+  # utenti remoti indicati in api.yaml: password generate per prosit_api_*, chieste per gli altri
+  local u pw
+  for u in $(python3 -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1]))
+print(" ".join(sorted({v for d in c["database"].values() for k,v in d.items() if k.startswith("utente_")})))' "$RADICE/config/api.yaml"); do
+    grep -q "^PW_${u^^}=" "$CONF/segreti.env" && continue
+    case "$u" in
+      prosit_api_ro|prosit_api_rw) pw=$(casuale 40) ;;
+      *) read -r -s -p "Password dell'utente remoto $u: " pw; echo >&2 ;;
+    esac
+    echo "PW_${u^^}=$pw" >> "$CONF/segreti.env"
+  done
+  if [ ! -s "$CONF/jwt-privata.pem" ]; then
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CONF/jwt-privata.pem" 2>/dev/null
+    ok "creata la coppia di chiavi RSA del token interno"
+  fi
+  openssl pkey -in "$CONF/jwt-privata.pem" -pubout -out "$CONF/jwt-pubblica.pem"
+  php "$RADICE/bin/jwk.php" "$CONF/jwt-pubblica.pem" prosit-lz-1 > "$CONF/jwt-pubblica.jwk"
+  leggibile_web "$CONF/jwt-privata.pem"
+  # impostazioni non segrete, rilette anche dal timer di manutenzione
+  {
+    echo "# Prosit API v2 — impostazioni dell'installazione (modificabili)"
+    # LIZMAP_DIR si salva solo se indicata a mano: altrimenti si segue l'Alias di Apache
+    [ -n "${LIZMAP_DIR:-}" ] && echo "LIZMAP_DIR=$LIZMAP_DIR"
+    echo "LIZMAP_URL=$LIZMAP_URL"
+    echo "PG_HOST=$PG_HOST"; echo "PG_PORTA=$PG_PORTA"; echo "PG_ADMIN=$PG_ADMIN"
+    echo "WEB_USER=$WEB_USER"; echo "WEB_GROUP=$WEB_GROUP"; echo "BACKUP_DIR=$BACKUP_DIR"
+    echo "# 1 solo se l'amministratore ha concesso la regola sudo per systemctl restart/reload"
+    echo "SUDO_SYSTEMCTL=${SUDO_SYSTEMCTL:-0}"
+  } > "$CONF/impostazioni.env"
+}
+
+carica_segreti(){
+  [ -r "$CONF/segreti.env" ] || errore "manca $CONF/segreti.env: eseguire prima 'prosit-api installa'"
+  set -a; . "$CONF/segreti.env"; set +a
+}
+
+# password dei database esterni: variabili psql -v pw_<utente>=... dalle righe PW_<UTENTE>=
+variabili_pw(){
+  local v=()
+  while IFS='=' read -r k val; do
+    [[ $k =~ ^PW_([A-Z0-9_]+)$ ]] || continue
+    v+=(-v "pw_${BASH_REMATCH[1],,}=${val}")
+  done < <(grep -E '^PW_[A-Z0-9_]+=' "$CONF/segreti.env")
+  printf '%s\0' "${v[@]}"
+}
+
+# configurazione del modulo Lizmap: fuori da Lizmap, non toccata dagli aggiornamenti
+config_modulo(){
+  carica_segreti
+  local f="$CONF/prositapi.ini.php"
+  if [ -s "$f" ]; then
+    sed -i "s|^db_password = .*|db_password = \"$GATEWAY_PASS\"|" "$f"
+    ok "prositapi.ini.php gia' presente (riallineata la password)"
+  else
+    sed -e "s|^db_password = .*|db_password = \"$GATEWAY_PASS\"|" \
+        -e "s|^jwt_privata = .*|jwt_privata = \"$ETC/jwt-privata.pem\"|" \
+        -e "s|^;php_jwt = .*|php_jwt = \"$DIR_FINALE/lib/php-jwt/src\"|" \
+        -e "s|^;db_porta = .*|db_porta = $PG_PORTA|" \
+        "$RADICE/etc/prositapi.ini.php.esempio" > "$f.nuovo"
+    mv "$f.nuovo" "$f"
+    ok "creato $f (per $ETC/prositapi.ini.php)"
+  fi
+  leggibile_web "$f"
+}
+
+# ------------------------------------------------------------------ database
+database(){
+  carica_segreti
+  info "Database"
+  "${PSQL[@]}" -d postgres -v authenticator_pass="$AUTHENTICATOR_PASS" -v gateway_pass="$GATEWAY_PASS" -f "$RADICE/sql/00_ruoli.sql"
+  "${PSQL[@]}" -d postgres -v ro_pass="$PW_PROSIT_API_RO" -v rw_pass="$PW_PROSIT_API_RW" \
+    -v base_ro="$FDW_BASE_RO" -v base_rw="$FDW_BASE_RW" -f "$RADICE/sql/05_utenti_fdw.sql"
+  "${PSQL[@]}" -d postgres -f "$RADICE/sql/10_database.sql"
+  for f in 20_struttura 30_auth 40_admin; do "${PSQL[@]}" -d api -f "$RADICE/sql/$f.sql"; done
+  ok "struttura del database api"
+}
+
+config_postgrest(){
+  carica_segreti
+  # postgrest.conf e la chiave pubblica non sono segreti: li legge il servizio (utente dinamico
+  # di systemd). postgrest.env (password) lo legge solo systemd.
+  sed "s|/etc/prosit-api|$ETC|g" "$RADICE/postgrest/prosit-api.conf" > "$CONF/postgrest.conf"
+  { echo "PGRST_DB_URI=postgres://authenticator:${AUTHENTICATOR_PASS}@${PG_HOST}:${PG_PORTA}/api"; } > "$CONF/postgrest.env"
+  chmod 0644 "$CONF/postgrest.conf" "$CONF/jwt-pubblica.jwk" "$CONF/jwt-pubblica.pem"; chmod 0600 "$CONF/postgrest.env"
+}
+
+applica(){
+  carica_segreti
+  info "Generazione da config/api.yaml"
+  python3 "$RADICE/bin/genera_api.py"
+  config_postgrest
+  info "Applicazione al database"
+  local vars=() err; while IFS= read -r -d '' x; do vars+=("$x"); done < <(variabili_pw)
+  err=$(mktemp)
+  if ! "${PSQL[@]}" -d api "${vars[@]}" -f "$RADICE/sql/generato/50_risorse.sql" 2> >(tee "$err" >&2); then
+    sleep 0.2
+    if grep -q 'password or GSSAPI\|password is required\|Non-superuser cannot connect' "$err"; then
+      rm -f "$err"
+      if [ "$PREP" = 1 ]; then
+        touch "$CONF/.pg_hba_da_fare"
+        avviso "collegamenti ai database esterni rimandati: PostgreSQL non chiede la password su 127.0.0.1 (pg_hba 'trust').
+    Lo script per l'amministratore aggiunge la regola con password solo per prosit_api_ro/prosit_api_rw
+    e completa questo passo ('prosit-api applica')."
+        return 0
+      fi
+      errore "PostgreSQL non chiede la password ai collegamenti tra database (pg_hba 'trust' su 127.0.0.1).
+    Serve la regola per prosit_api_ro/prosit_api_rw: vedi README §3 (pg_hba) o rigenerare per-amministratore.sh"
+    fi
+    rm -f "$err"; errore "applicazione al database non riuscita (vedi sopra)"
+  fi
+  rm -f "$err" "$CONF/.pg_hba_da_fare"
+  for f in "$RADICE"/sql/6[0-9]_*.sql "$RADICE"/sql/7[0-9]_*.sql; do
+    [ -f "$f" ] && { "${PSQL[@]}" -d api -f "$f"; ok "$(basename "$f")"; }
+  done
+  "${PSQL[@]}" -d api -c "NOTIFY pgrst, 'reload schema'"
+  python3 "$RADICE/bin/genera_api.py" --solo-openapi --psql "${PSQL[*]} -d api"
+  pgrst ricarica >/dev/null
+  ok "applicato; documentazione: openapi/prosit-api-v2.yaml"
+}
+
+# ------------------------------------------------------------------ PostgREST (servizio systemd)
+pronto(){ curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:3101/ready 2>/dev/null; }
+
+pgrst(){
+  case "${1:-stato}" in
+    stato)
+      local a="non installato"; command -v systemctl >/dev/null && a=$(systemctl is-active "$SERVIZIO" 2>/dev/null || true)
+      if pronto; then ok "PostgREST pronto (servizio $SERVIZIO: ${a:-?})"; return 0; fi
+      avviso "PostgREST non risponde (servizio $SERVIZIO: ${a:-?}). Log: journalctl -u $SERVIZIO"; return 1
+      ;;
+    ricarica)
+      # senza privilegi: PostgREST ascolta il canale "pgrst" del database e rilegge configurazione,
+      # chiave pubblica e struttura (equivale a systemctl reload)
+      [ "${SUDO_SYSTEMCTL:-0}" = 1 ] && { sudo -n systemctl reload "$SERVIZIO" || true; }
+      "${PSQL[@]}" -d api -c "NOTIFY pgrst, 'reload config'" -c "NOTIFY pgrst, 'reload schema'"
+      ok "PostgREST: configurazione e struttura ricaricate"
+      ;;
+    riavvia)
+      # serve solo dopo aver cambiato il binario: richiede la regola sudo facoltativa (README §3)
+      if [ "${SUDO_SYSTEMCTL:-0}" = 1 ] && sudo -n systemctl restart "$SERVIZIO"; then
+        sleep 2; pgrst stato
+      else
+        errore "riavvio non consentito a $(id -un). Chiedere all'amministratore: systemctl restart $SERVIZIO
+    (oppure la regola sudo facoltativa del README §3, poi SUDO_SYSTEMCTL=1 in $ETC/impostazioni.env)"
+      fi
+      ;;
+    *) errore "uso: prosit-api postgrest stato|ricarica|riavvia" ;;
+  esac
+}
+
+# unita' systemd con i percorsi e l'utente di questa installazione, da consegnare all'amministratore
+unita_systemd(){
+  local d="$CONF/systemd" u; u=$(id -un)
+  install -d -m 0755 "$d"
+  for f in "$RADICE"/systemd/*; do
+    sed -e "s|@ETC@|$ETC|g" -e "s|@PGRST_BIN@|$PGRST_BIN|g" -e "s|@RADICE@|$DIR_FINALE|g" \
+        -e "s|@UTENTE@|$u|g" -e "s|@GRUPPO@|$(id -gn)|g" "$f" > "$d/$(basename "$f")"
+    chmod 0644 "$d/$(basename "$f")"
+  done
+  ok "unita' systemd pronte in $d"
+}
+
+istruzioni_admin(){
+  local u; u=$(id -un)
+  cat <<FINE
+
+  ------------------------------------------------------------------------------
+  Da inviare all'amministratore della VM (una sola volta, da root). Si possono dare anche
+  PRIMA dell'installazione definitiva: PostgREST parte da solo quando la configurazione c'e'.
+
+    install -m 0644 $CONF/systemd/$SERVIZIO.service $CONF/systemd/$SERVIZIO.path \\
+                    $CONF/systemd/prosit-api-manutenzione.service \\
+                    $CONF/systemd/prosit-api-manutenzione.timer /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now $SERVIZIO.path $SERVIZIO prosit-api-manutenzione.timer
+
+  Per il futuro (cosi' $u non deve chiedere ogni volta): leggere i log e riavviare/ricaricare
+  solo questo servizio (il file sudoers viene controllato prima di essere installato):
+    usermod -aG systemd-journal $u
+    echo '$u ALL=(root) NOPASSWD: /usr/bin/systemctl restart $SERVIZIO, /usr/bin/systemctl reload $SERVIZIO' > /tmp/prosit-api.sudoers
+    visudo -cf /tmp/prosit-api.sudoers && install -m 0440 /tmp/prosit-api.sudoers /etc/sudoers.d/prosit-api
+  ------------------------------------------------------------------------------
+FINE
+}
+
+# Avvio di prova di PostgREST con il proprio utente (prima che esista il servizio): verifica
+# binario, collegamento al database, chiave pubblica e firma RS256 dei token del modulo.
+token_prova(){
+  php -r '$d=$argv[1]; spl_autoload_register(function($c) use($d){ if (strpos($c,"Firebase\\JWT\\")===0) require $d."/".substr($c,13).".php"; });
+    $t=time(); echo \Firebase\JWT\JWT::encode(["iss"=>"prosit-lizmap","aud"=>$argv[3],"sub"=>"prova-installazione",
+    "role"=>"web_anon","iat"=>$t,"nbf"=>$t-5,"exp"=>$t+60], file_get_contents($argv[2]), "RS256", "prosit-lz-1");' \
+    "$PHP_JWT" "$1" "$(awk -F'"' '/^jwt-aud/{print $2}' "$CONF/postgrest.conf")"
+}
+prova_postgrest(){
+  info "Prova di PostgREST (avvio temporaneo con il tuo utente, poi spento)"
+  if pronto; then ok "PostgREST gia' attivo: prova saltata"; return 0; fi
+  curl -s -o /dev/null --max-time 2 http://127.0.0.1:3100/ && errore "la porta 3100 e' gia' occupata da un altro programma"
+  local d pid c corpo i; d=$(mktemp -d "$CONF/.prova.XXXXXX")
+  sed "s|$ETC/|$CONF/|g" "$CONF/postgrest.conf" > "$d/postgrest.conf"
+  ( set -a; . "$CONF/postgrest.env"; set +a; exec "$PGRST_BIN" "$d/postgrest.conf" ) > "$d/log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 30); do pronto && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+  if ! pronto; then
+    kill "$pid" 2>/dev/null || true; tail -n 20 "$d/log"; rm -rf "$d"
+    errore "PostgREST non parte (log qui sopra)"
+  fi
+  ok "PostgREST parte, si collega al database api come authenticator e carica la struttura"
+  c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/risorse)
+  [ "$c" = 401 ] && ok "richiesta senza token: rifiutata (401)" || avviso "richiesta senza token: $c (atteso 401)"
+  corpo=$(curl -s -H "Authorization: Bearer $(token_prova "$CONF/jwt-privata.pem")" http://127.0.0.1:3100/risorse)
+  if grep -q '"code":"PGRST30' <<<"$corpo"; then
+    kill "$pid"; rm -rf "$d"; errore "PostgREST rifiuta il token firmato con la chiave del modulo: $corpo"
+  fi
+  ok "token RS256 firmato con la chiave del modulo (php-jwt): accettato"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$d/altra.pem" 2>/dev/null
+  corpo=$(curl -s -H "Authorization: Bearer $(token_prova "$d/altra.pem")" http://127.0.0.1:3100/risorse)
+  grep -q '"code":"PGRST30' <<<"$corpo" && ok "token firmato con un'altra chiave: rifiutato" \
+    || avviso "token firmato con un'altra chiave NON rifiutato: $corpo"
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$d"
+  ok "PostgREST spento: lo avviera' il servizio systemd"
+}
+
+# Script unico per l'amministratore: copia software e configurazione al loro posto con i
+# permessi giusti, installa e avvia i servizi, aggiunge le due righe ad Apache e lo ricarica.
+script_admin(){
+  local f="$CONF/per-amministratore.sh" L; L=$(lizmap_dir)
+  cat > "$f" <<FINE
+#!/bin/bash
+# =============================================================================
+# Prosit API v2 — operazioni da root, da eseguire UNA volta (rilanciabile).
+# Generato da "prosit-api installa" il $(date '+%F %H:%M') per l'utente $(id -un).
+#   sudo bash $f
+# Ogni passo dice cosa fa; se qualcosa non va si ferma senza lasciare Apache rotto.
+# =============================================================================
+set -euo pipefail
+UTENTE=$(id -un); GRUPPO=$(id -gn); WEB=$WEB_GROUP
+CODICE=$RADICE                  # pacchetto preparato dall'utente
+PREPARATA=$CONF                 # configurazione preparata dall'utente
+DEST=$DIR_FINALE; ETC=$ETC
+LIZMAP_WWW=$L/www
+PG_PORTA=$PG_PORTA
+PG_HBA_DA_FARE=$([ -f "$CONF/.pg_hba_da_fare" ] && echo 1 || echo 0)
+APACHE_SITI="/etc/apache2/sites-available/000-default.conf /etc/apache2/sites-available/default-ssl.conf"
+FINE
+  cat >> "$f" <<'FINE'
+[ "$(id -u)" -eq 0 ] || { echo "Da eseguire come root:  sudo bash $0"; exit 1; }
+passo(){ printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+
+passo "1/6 Utente $UTENTE nel gruppo $WEB"
+usermod -aG "$WEB" "$UTENTE"
+
+passo "2/6 Software in $DEST"
+install -d -o "$UTENTE" -g "$GRUPPO" -m 0755 "$DEST"
+[ "$CODICE" = "$DEST" ] || cp -a "$CODICE/." "$DEST/"
+chown -R "$UTENTE:$GRUPPO" "$DEST"; chmod -R a+rX "$DEST/lib"
+
+passo "3/6 Configurazione e segreti in $ETC"
+install -d -o "$UTENTE" -g "$WEB" -m 0711 "$ETC"
+[ "$PREPARATA" = "$ETC" ] || cp -a "$PREPARATA/." "$ETC/"
+rm -f "$ETC/per-amministratore.sh" "$ETC/.pg_hba_da_fare"
+chown -R "$UTENTE:$GRUPPO" "$ETC"; chown "$UTENTE:$WEB" "$ETC"; chmod 0711 "$ETC"
+chmod 0600 "$ETC"/*.env
+chown "$UTENTE:$WEB" "$ETC/prositapi.ini.php" "$ETC/jwt-privata.pem"
+chmod 0640 "$ETC/prositapi.ini.php" "$ETC/jwt-privata.pem"
+chmod 0644 "$ETC/postgrest.conf" "$ETC/jwt-pubblica.pem" "$ETC/jwt-pubblica.jwk"
+chmod 0755 "$ETC/systemd"; chmod 0644 "$ETC/systemd"/*
+
+passo "4/6 PostgreSQL: password per i collegamenti della Prosit API tra database"
+if [ "$PG_HBA_DA_FARE" = 1 ]; then
+  PGS=(sudo -u postgres psql -X -At -p "$PG_PORTA")
+  HBA=$("${PGS[@]}" -c 'SHOW hba_file')
+  if ! grep -q 'prosit_api_ro' "$HBA"; then
+    cp -a "$HBA" "$HBA.prima-di-prosit-api.$(date +%Y%m%d-%H%M%S)"
+    { echo "# Prosit API v2: i collegamenti tra database (postgres_fdw) richiedono la password."
+      echo "# Solo per questi due utenti; tutto il resto resta come prima. Aggiunto da per-amministratore.sh"
+      echo "host    all    prosit_api_ro,prosit_api_rw    127.0.0.1/32    scram-sha-256"
+      echo "host    all    prosit_api_ro,prosit_api_rw    ::1/128         scram-sha-256"
+      echo
+      cat "$HBA"; } > "$HBA.nuovo"
+    cat "$HBA.nuovo" > "$HBA"; rm -f "$HBA.nuovo"
+    if [ "$("${PGS[@]}" -c 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL')" != 0 ]; then
+      cp -a "$(ls -1t "$HBA".prima-di-prosit-api.* | head -1)" "$HBA"
+      echo "pg_hba.conf non valido dopo la modifica: ripristinato. Nient'altro e' stato cambiato in PostgreSQL."; exit 1
+    fi
+    "${PGS[@]}" -c 'SELECT pg_reload_conf()' >/dev/null
+    echo "$HBA: aggiunte due righe in testa (copia di prima accanto al file), configurazione ricaricata"
+  else
+    echo "regola gia' presente in $HBA"
+  fi
+  echo "completamento del database api (prosit-api applica, come $UTENTE):"
+  sudo -u "$UTENTE" -H "$DEST/bin/prosit-api" applica-db
+else
+  echo "non necessario"
+fi
+
+passo "5/6 Servizio PostgREST e manutenzione settimanale (systemd)"
+install -m 0644 "$ETC/systemd/postgrest-prosit-api.service" "$ETC/systemd/postgrest-prosit-api.path" "$ETC/systemd/prosit-api-manutenzione.service" \
+                "$ETC/systemd/prosit-api-manutenzione.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable postgrest-prosit-api.path postgrest-prosit-api prosit-api-manutenzione.timer
+systemctl restart postgrest-prosit-api
+systemctl start prosit-api-manutenzione.timer
+for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:3101/ready 2>/dev/null && break; sleep 1; done
+if curl -fsS -o /dev/null http://127.0.0.1:3101/ready 2>/dev/null; then
+  echo "PostgREST attivo e pronto"
+else
+  systemctl status postgrest-prosit-api --no-pager || true
+  journalctl -u postgrest-prosit-api -n 30 --no-pager || true
+  echo "PostgREST non e' partito: inviare questo output a chi gestisce la Prosit API. Apache non e' stato toccato."
+  exit 1
+fi
+
+passo "6/6 Apache: CGIPassAuth On (Basic con PHP-FPM) e solo TLS 1.2/1.3"
+B=/var/backups/apache-prosit-api-$(date +%Y%m%d-%H%M%S); mkdir -p "$B"
+for f in $APACHE_SITI; do [ -f "$f" ] && cp -a "$f" "$B/"; done
+echo "copia delle configurazioni attuali in $B"
+for f in $APACHE_SITI; do
+  [ -f "$f" ] || continue
+  if ! grep -q 'CGIPassAuth' "$f"; then
+    awk -v w="<Directory $LIZMAP_WWW" '{print} index($0, w) {dentro=1}
+      dentro && /DirectoryIndex/ {match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "CGIPassAuth On"; dentro=0}' "$f" > "$f.nuovo"
+    cat "$f.nuovo" > "$f"; rm -f "$f.nuovo"
+    grep -q 'CGIPassAuth' "$f" && echo "$f: aggiunto CGIPassAuth On" \
+      || echo "ATTENZIONE $f: blocco <Directory $LIZMAP_WWW> non trovato, CGIPassAuth non aggiunto"
+  fi
+  if grep -q 'SSLEngine' "$f" && ! grep -q 'SSLProtocol' "$f"; then
+    awk '/SSLEngine[ \t]+on/ && !fatto {match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "SSLProtocol -all +TLSv1.2 +TLSv1.3"; fatto=1} {print}' "$f" > "$f.nuovo"
+    cat "$f.nuovo" > "$f"; rm -f "$f.nuovo"
+    echo "$f: aggiunto SSLProtocol -all +TLSv1.2 +TLSv1.3"
+  fi
+done
+if apachectl configtest; then
+  systemctl reload apache2 && echo "Apache ricaricato"
+else
+  echo "configtest NON superato: ripristino le configurazioni originali (Apache non e' stato ricaricato)"
+  for f in "$B"/*; do cp -a "$f" /etc/apache2/sites-available/; done
+  exit 1
+fi
+
+# --- Facoltativi (togliere il commento se si vogliono) ---
+# l'utente puo' leggere i log di PostgREST:
+#   usermod -aG systemd-journal "$UTENTE"
+# l'utente puo' riavviare/ricaricare solo il servizio PostgREST (poi SUDO_SYSTEMCTL=1 in $ETC/impostazioni.env):
+#   echo "$UTENTE ALL=(root) NOPASSWD: /usr/bin/systemctl restart postgrest-prosit-api, /usr/bin/systemctl reload postgrest-prosit-api" \
+#     > /etc/sudoers.d/prosit-api && chmod 0440 /etc/sudoers.d/prosit-api && visudo -c
+
+printf '\n\033[32mFatto.\033[0m %s deve uscire e rientrare da SSH (nuovo gruppo) e lanciare:\n  %s/bin/prosit-api verifica\n' "$UTENTE" "$DEST"
+FINE
+  chmod 0700 "$f"
+  bash -n "$f" || errore "script per l'amministratore non valido (segnalare)"
+  ok "script per l'amministratore: $f"
+}
+
+# ------------------------------------------------------------------ esercizio
+verifica(){
+  info "Verifica"
+  if [ "$PREP" = 1 ]; then
+    "${PSQL[@]}" -d api -At -F ' | ' -c "SELECT esito, controllo, dettaglio FROM api_admin.verifica() WHERE esito <> 'OK'" | grep '^ERRORE' \
+      && errore "controlli di sicurezza del database non superati" || ok "permessi del database"
+    controlla_php_jwt
+    avviso "preparazione: la verifica completa si fa dopo per-amministratore.sh"
+    return 0
+  fi
+  local errori
+  errori=$("${PSQL[@]}" -d api -At -F ' | ' -c "SELECT esito, controllo, dettaglio FROM api_admin.verifica() WHERE esito <> 'OK'")
+  if grep -q '^ERRORE' <<<"$errori"; then echo "$errori"; errore "controlli di sicurezza del database non superati"; fi
+  [ -n "$errori" ] && echo "$errori"
+  ok "permessi del database"
+  if pgrst stato; then
+    local c; c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/segnalazioni)
+    [ "$c" = "401" ] && ok "PostgREST rifiuta le richieste senza token" || avviso "PostgREST senza token ha risposto $c (atteso 401)"
+  fi
+  if command -v systemctl >/dev/null && systemctl is-enabled --quiet "$SERVIZIO" 2>/dev/null; then
+    ok "servizio $SERVIZIO abilitato all'avvio"
+    systemctl is-active --quiet prosit-api-manutenzione.timer && ok "timer di manutenzione attivo" \
+      || avviso "timer prosit-api-manutenzione non attivo (backup e pulizia settimanali)"
+  else
+    avviso "servizio $SERVIZIO non installato: unita' in $CONF/systemd, istruzioni con 'prosit-api systemd'"
+  fi
+  if command -v ss >/dev/null; then
+    ss -ltn | grep -E ':310[01] ' | grep -vq '127.0.0.1' && avviso "PostgREST in ascolto fuori da 127.0.0.1!" || ok "PostgREST solo in locale"
+  fi
+  local m
+  m=$(stat -c '%a' "$CONF/segreti.env"); [ "$m" = "600" ] && ok "segreti.env 0600" || avviso "segreti.env ha permessi $m (atteso 600)"
+  for f in "$CONF/prositapi.ini.php" "$CONF/jwt-privata.pem"; do
+    web_legge "$f" || avviso "$f non leggibile da $WEB_USER"
+    (( $((8#$(stat -c '%a' "$f"))) & 0004 )) && avviso "$f leggibile da tutti (vedi README, permessi)"
+  done
+  ok "configurazione del modulo leggibile da $WEB_USER"
+  local prov=${PROSIT_API_PREP:-$HOME/prosit-api-config}
+  [ -d "$prov" ] && [ "$prov" != "$CONF" ] && avviso "copia provvisoria dei segreti ancora in $prov: ora che e' tutto in $ETC cancellarla (rm -rf $prov)"
+  [ -f "$HOME/.pgpass" ] && { m=$(stat -c '%a' "$HOME/.pgpass"); [ "$m" = "600" ] || avviso "~/.pgpass ha permessi $m (atteso 600)"; }
+  controlla_php_jwt
+  local L; L=$(lizmap_dir)
+  if [ -f "$L/lizmap-modules/$MODULO/module.xml" ]; then
+    diff -rq "$RADICE/lizmap-module/$MODULO" "$L/lizmap-modules/$MODULO" >/dev/null \
+      && ok "modulo in Lizmap allineato al pacchetto" || avviso "il modulo in Lizmap differisce dal pacchetto: lanciare 'prosit-api lizmap'"
+    grep -q "$MODULO" "$L/var/config/localurls.xml" 2>/dev/null && ok "URL del modulo registrate" || avviso "URL non registrate: lanciare 'prosit-api lizmap'"
+  else
+    grep -q "$MODULO" "$L/var/config/localurls.xml" 2>/dev/null \
+      && errore "manca lizmap-modules/$MODULO ma localurls.xml lo cita: Lizmap e' in errore. Lanciare SUBITO 'prosit-api lizmap'"
+    avviso "modulo non installato in Lizmap: lanciare 'prosit-api lizmap'"
+  fi
+  if [ "$(driver_profilo "$L/var/config/profiles.ini.php" jauth)" = pgsql ]; then
+    ok "utenti di Lizmap in PostgreSQL"
+  else
+    ok "utenti di Lizmap in SQLite (var/db/jauth.db); per passare a PostgreSQL: prosit-api utenti-pg"
+    for f in "$L/var/db/jauth.db"; do [ -e "$f" ] && ! web_scrive "$f" && avviso "$f non scrivibile da $WEB_USER"; done
+  fi
+  for f in "$L/var/config/localconfig.ini.php"; do
+    [ -e "$f" ] && ! web_scrive "$f" && avviso "$f non scrivibile da $WEB_USER"
+  done
+  controlla_lizmap
+}
+
+backup(){
+  install -d -m 0700 "$BACKUP_DIR" 2>/dev/null || errore "non posso scrivere in $BACKUP_DIR. L'amministratore, una volta:
+    install -d -o $(id -un) -g $(id -gn) -m 0700 $BACKUP_DIR"
+  local t; t=$(mktemp -d "$BACKUP_DIR/.backup.XXXXXX")
+  cp -p "$CONF"/*.* "$t/"
+  # pg_dump della stessa versione del server (su Ubuntu/Debian ce ne possono essere piu' d'una)
+  local v d=pg_dump; v=$("${PSQL[@]}" -d postgres -At -c "SELECT current_setting('server_version_num')::int / 10000")
+  [ -x "/usr/lib/postgresql/$v/bin/pg_dump" ] && d=/usr/lib/postgresql/$v/bin/pg_dump
+  # database api e, se esiste, quello degli utenti di Lizmap (BACKUP_DB per cambiare l'elenco)
+  local db
+  for db in ${BACKUP_DB:-api lizmap}; do
+    [ "$("${PSQL[@]}" -d postgres -At -c "SELECT count(*) FROM pg_database WHERE datname = '$db'")" = 1 ] || continue
+    "$d" -h "$PG_HOST" -p "$PG_PORTA" -U "$PG_ADMIN" -w -Fc -f "$t/$db.dump" "$db" || { rm -rf "$t"; errore "pg_dump di $db non riuscito"; }
+  done
+  local f="$BACKUP_DIR/prosit-api-$(date +%Y%m%d-%H%M).tar.gz"
+  tar -czf "$f" -C "$t" . && chmod 0600 "$f"; rm -rf "$t"
+  ls -1t "$BACKUP_DIR"/prosit-api-*.tar.gz | tail -n +9 | xargs -r rm -f   # ne tiene 8
+  ok "backup: $f (contiene i segreti: non copiarlo altrove in chiaro)"
+}
+
+ruota_jwt(){
+  info "Rotazione chiavi del token interno"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$CONF/jwt-privata.pem.nuova" 2>/dev/null
+  openssl pkey -in "$CONF/jwt-privata.pem.nuova" -pubout -out "$CONF/jwt-pubblica.pem"
+  php "$RADICE/bin/jwk.php" "$CONF/jwt-pubblica.pem" prosit-lz-1 > "$CONF/jwt-pubblica.jwk"
+  leggibile_web "$CONF/jwt-privata.pem.nuova"
+  mv "$CONF/jwt-privata.pem.nuova" "$CONF/jwt-privata.pem"
+  chmod 0644 "$CONF/jwt-pubblica.jwk" "$CONF/jwt-pubblica.pem"
+  pgrst ricarica
+  ok "chiavi ruotate (i token durano 60 secondi: al massimo qualche richiesta da ripetere)"
+}
+
+pulizia(){
+  "${PSQL[@]}" -d api -c "CALL api_admin.pulisci_audit(${1:-365})" -c "CALL api_admin.pulisci_utenti(${2:-180})"
+  ok "pulizia eseguita"
+}
+
+# ---------------------------------------------------------------------------- utenti in PostgreSQL
+# Utenti, gruppi e diritti di Lizmap (profilo jdb "jauth") e registro (profilo "lizlog") da SQLite
+# (var/db/jauth.db, logs.db) a un database PostgreSQL proprio, con i comandi ufficiali di Lizmap
+# (database:migrateusers / database:migratelog). Database SEPARATO da "api": PostgREST non deve
+# poter arrivare agli hash delle password. Se qualcosa non torna rimette la configurazione di prima.
+driver_profilo(){ # driver_profilo <profiles.ini.php> <profilo>
+  awk -v s="[jdb:$2]" '$0==s{d=1;next} /^\[/{d=0} d && /^[ \t]*driver[ \t]*=/{sub(/^[^=]*=[ \t]*/,"");gsub(/"/,"");print;exit}' "$1"
+}
+conta_sqlite(){ php -r '$d=new SQLite3($argv[1], SQLITE3_OPEN_READONLY); echo (int)@$d->querySingle("SELECT count(*) FROM \"".$argv[2]."\"");' "$1" "$2" 2>/dev/null || echo "?"; }
+ripristina_profili(){ # ripristina_profili <profiles.ini.php> <copia>
+  cat "$2" > "$1"; pulisci_cache_lizmap "$(dirname "$(dirname "$(dirname "$1")")")" >/dev/null
+}
+valore_profilo(){ # valore_profilo <profiles.ini.php> <profilo> <chiave>
+  awk -v s="[jdb:$2]" -v k="$3" '$0==s{d=1;next} /^\[/{d=0} d { split($0,a,"="); gsub(/[ \t"]/,"",a[1]); if (a[1]==k) { v=substr($0,index($0,"=")+1); gsub(/^[ \t"]+|[ \t"]+$/,"",v); print v; exit } }' "$1"
+}
+# Tabelle che database:migrateusers non crea: jauthremembertoken (accesso "ricordami", Jelix 1.8.24,
+# Lizmap 3.9.12+). Senza, Lizmap va in errore 500 quando elimina un utente o al logout con "ricordami".
+# Avvisa anche di altre tabelle presenti in jauth.db e mancanti in PostgreSQL.
+completa_tabelle_pg(){ # completa_tabelle_pg <lizmap> <database> <utente>
+  local L=$1 DB=$2 R=$3 t mancanti=()
+  "${PSQL[@]}" -d "$DB" -v r="$R" <<'SQL'
+SELECT format('SET ROLE %I', :'r') \gexec
+CREATE TABLE IF NOT EXISTS jauthremembertoken (
+    token_hash character varying(128) NOT NULL,
+    series_hash character varying(128) NOT NULL,
+    login character varying(255) NOT NULL,
+    expires_at integer DEFAULT 0 NOT NULL,
+    created_at timestamp NOT NULL,
+    CONSTRAINT jauthremembertoken_pkey PRIMARY KEY (login, token_hash)
+);
+CREATE INDEX IF NOT EXISTS jauthremembertoken_login_series_hash_idx ON jauthremembertoken (login, series_hash);
+RESET ROLE;
+SQL
+  ok "tabella jauthremembertoken presente (accesso \"ricordami\", eliminazione utenti)"
+  [ -s "$L/var/db/jauth.db" ] || return 0
+  while read -r t; do
+    [ -n "$t" ] || continue
+    [ "$("${PSQL[@]}" -d "$DB" -At -c "SELECT to_regclass('public.$t') IS NOT NULL")" = t ] || mancanti+=("$t")
+  done < <(php -r '$d=new SQLite3($argv[1], SQLITE3_OPEN_READONLY); $r=$d->query("SELECT name FROM sqlite_master WHERE type=\"table\" AND name NOT LIKE \"sqlite_%\""); while ($x=$r->fetchArray()) echo $x[0], "\n";' "$L/var/db/jauth.db" 2>/dev/null)
+  [ ${#mancanti[@]} -eq 0 ] && ok "tutte le tabelle di jauth.db sono anche in PostgreSQL" \
+    || avviso "tabelle di jauth.db non presenti in PostgreSQL: ${mancanti[*]} (segnalarlo)"
+}
+utenti_pg(){
+  local L F DB=${LIZMAP_DB:-lizmap} R=${LIZMAP_DB_UTENTE:-lizmap_app} B pw out t a b diversi=0
+  # registro di Lizmap (lizlog): resta in SQLite salvo LIZMAP_LOG_PG=1. In Lizmap 3.9.12 la sua
+  # migrazione (database:migratelog) e' difettosa (colonna log_timestamp) e i log non sono essenziali.
+  local profili=jauth attesi=1
+  [ "${LIZMAP_LOG_PG:-0}" = 1 ] && { profili="jauth lizlog"; attesi=2; }
+  L=$(lizmap_dir); F=$L/var/config/profiles.ini.php
+  info "Utenti di Lizmap in PostgreSQL: database $DB, utente $R (Lizmap in $L)"
+  [ -w "$F" ] || errore "$F non scrivibile dal tuo utente"
+  [[ $DB =~ ^[a-z_][a-z0-9_]*$ && $R =~ ^[a-z_][a-z0-9_]*$ ]] || errore "nomi non validi: $DB / $R"
+  if [ "$(driver_profilo "$F" jauth)" = pgsql ]; then
+    ok "gli utenti sono gia' in PostgreSQL ($F)"
+    completa_tabelle_pg "$L" "$(valore_profilo "$F" jauth database)" "$(valore_profilo "$F" jauth user)"
+    return 0
+  fi
+  [ -s "$L/var/db/jauth.db" ] || errore "manca $L/var/db/jauth.db"
+  php -r 'exit(class_exists("SQLite3") && extension_loaded("pdo_pgsql") ? 0 : 1);' || errore "servono le estensioni PHP sqlite3 e pdo_pgsql"
+
+  B=$HOME/backup/lizmap-utenti-$(date +%Y%m%d-%H%M%S); install -d -m 0700 "$B"
+  cp -p "$F" "$L/var/db/jauth.db" "$B/"; [ -f "$L/var/db/logs.db" ] && cp -p "$L/var/db/logs.db" "$B/"
+  ok "copia di profiles.ini.php, jauth.db e logs.db in $B"
+
+  local esiste; esiste=$("${PSQL[@]}" -d postgres -At -c "SELECT count(*) FROM pg_database WHERE datname = '$DB'") \
+    || errore "PostgreSQL non raggiungibile come $PG_ADMIN (PG_ADMIN, ~/.pgpass)"
+  [ "$esiste" = 0 ] || errore "il database $DB esiste gia': se e' un tentativo precedente non andato a buon fine, cancellarlo (DROP DATABASE $DB) e rilanciare"
+  pw=$(casuale 32)
+  "${PSQL[@]}" -d postgres -v r="$R" -v pw="$pw" -v db="$DB" <<'SQL'
+SELECT format('CREATE ROLE %I LOGIN', :'r') WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'r') \gexec
+SELECT format('ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 50 PASSWORD %L', :'r', :'pw') \gexec
+SELECT format('COMMENT ON ROLE %I IS %L', :'r', 'Lizmap: utenti, gruppi, diritti e registro (profili jauth e lizlog)') \gexec
+SELECT format('CREATE DATABASE %I OWNER %I ENCODING ''UTF8'' TEMPLATE template0', :'db', :'r') \gexec
+SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'db') \gexec
+SQL
+  ok "database $DB creato, proprieta' di $R (nessun altro utente puo' collegarsi)"
+
+  python3 - "$F" "$PG_HOST" "$PG_PORTA" "$DB" "$R" "$pw" $profili <<'PYEOF2'
+import re, sys
+f, host, port, db, user, pw = sys.argv[1:7]
+profili = sys.argv[7:]
+s = open(f).read()
+def blocco(nome, prima):
+    return (f'[jdb:{nome}]\n; {prima} in PostgreSQL (prima: SQLite). Per tornare indietro: prosit-api utenti-sqlite\n'
+            f'driver=pgsql\nhost={host}\nport={port}\ndatabase={db}\nuser={user}\npassword="{pw}"\n\n')
+for nome, prima in (('jauth', 'utenti, gruppi e diritti di Lizmap'), ('lizlog', 'registro di Lizmap')):
+    if nome not in profili:
+        continue
+    nuovo = blocco(nome, prima)
+    s, n = re.subn(r'^\[jdb:' + nome + r'\][^\n]*\n(?:(?!\[)[^\n]*\n?)*', lambda m: nuovo, s, count=1, flags=re.M)
+    if n == 0:
+        s = s.rstrip('\n') + '\n\n' + nuovo
+open(f, 'w').write(s)   # stesso file: permessi e ACL restano quelli di prima
+PYEOF2
+  [ "$(driver_profilo "$F" jauth)" = pgsql ] && { [ "$attesi" = 1 ] || [ "$(driver_profilo "$F" lizlog)" = pgsql ]; } \
+    || { ripristina_profili "$F" "$B/profiles.ini.php"; errore "modifica di profiles.ini.php non riuscita: rimesso il file di prima"; }
+  pulisci_cache_lizmap "$L" >/dev/null     # la cache contiene anche i profili
+
+  info "Copia di utenti, gruppi e diritti (database:migrateusers)"
+  out=$(cd "$L" && php console.php database:migrateusers 2>&1) || true
+  if [ "$attesi" = 2 ]; then
+    info "Copia del registro (database:migratelog)"
+    out+=$'\n'$(cd "$L" && php console.php database:migratelog 2>&1) || true
+  fi
+  if [ "$(grep -c 'Migration done' <<<"$out")" != "$attesi" ] || grep -q 'Insert ERROR\|Error during' <<<"$out"; then
+    grep -v -e Deprecated -e 'PHP Warning' <<<"$out" | tail -n 12
+    ripristina_profili "$F" "$B/profiles.ini.php"
+    errore "migrazione non riuscita: Lizmap e' tornato a SQLite. Il database $DB resta (vuoto o parziale): cancellarlo prima di riprovare"
+  fi
+  ok "migrazione eseguita"
+
+  for t in jlx_user jacl2_group jacl2_user_group jacl2_rights jacl2_subject jacl2_subject_group geobookmark; do
+    a=$(conta_sqlite "$B/jauth.db" "$t"); b=$("${PSQL[@]}" -d "$DB" -At -c "SELECT count(*) FROM public.$t" 2>/dev/null || echo "?")
+    printf '   %-22s SQLite %-6s PostgreSQL %s\n' "$t" "$a" "$b"; [ "$a" = "$b" ] || diversi=1
+  done
+  if [ "$diversi" = 1 ]; then
+    ripristina_profili "$F" "$B/profiles.ini.php"
+    errore "i conteggi non coincidono: Lizmap e' tornato a SQLite (database $DB da cancellare prima di riprovare)"
+  fi
+  ok "stessi dati in SQLite e in PostgreSQL"
+  completa_tabelle_pg "$L" "$DB" "$R"
+
+  sistema_permessi_lizmap "$L"
+  if [ "$(curl -sk -o /dev/null -w '%{http_code}' "$LIZMAP_URL/index.php" || true)" != 200 ]; then
+    ripristina_profili "$F" "$B/profiles.ini.php"
+    errore "Lizmap non risponde con gli utenti in PostgreSQL: tornato a SQLite"
+  fi
+  controlla_lizmap
+  cat <<FINE
+
+Fatto: Lizmap legge utenti, gruppi e diritti dal database $DB.
+ - Registro degli accessi: $( [ "$attesi" = 2 ] && echo "anche lui in $DB" || echo "resta in var/db/logs.db (LIZMAP_LOG_PG=1 per spostarlo)").
+ - Prova subito: accesso a Lizmap dal browser, Amministrazione -> Utenti, una mappa riservata.
+ - jauth.db resta dove e' (Lizmap non lo usa piu'); copia anche in $B.
+ - Per tornare indietro: $DIR_FINALE/bin/prosit-api utenti-sqlite
+   (le modifiche fatte nel frattempo a utenti e password NON tornano in SQLite).
+ - Sicurezza: la password di $R e' in $F. Su questa VM i collegamenti da 127.0.0.1 sono in
+   "trust": chiedere all'amministratore una riga scram-sha-256 per $R in pg_hba.conf
+   (docs/UTENTI-POSTGRESQL.md).
+FINE
+}
+utenti_sqlite(){
+  local L F B
+  L=$(lizmap_dir); F=$L/var/config/profiles.ini.php
+  [ "$(driver_profilo "$F" jauth)" = pgsql ] || { ok "gli utenti sono gia' in SQLite"; return 0; }
+  B=$(ls -1dt "$HOME"/backup/lizmap-utenti-*/ 2>/dev/null | head -1)
+  [ -n "$B" ] && [ -f "$B/profiles.ini.php" ] || errore "nessuna copia in ~/backup/lizmap-utenti-*: rimettere a mano driver=sqlite3 in $F"
+  [ "$(driver_profilo "$B/profiles.ini.php" jauth)" != pgsql ] || errore "la copia $B/profiles.ini.php non e' quella con SQLite"
+  avviso "si torna a SQLite con la configurazione di $B: le modifiche a utenti e gruppi fatte dopo la migrazione non ci sono"
+  ripristina_profili "$F" "$B/profiles.ini.php"
+  sistema_permessi_lizmap "$L"
+  controlla_lizmap
+  ok "Lizmap usa di nuovo var/db/jauth.db (il database PostgreSQL non e' stato toccato)"
+}
+
+collega_comando(){
+  { [ ! -e "$PGRST_DIR/prosit-api" ] || [ -L "$PGRST_DIR/prosit-api" ]; } \
+    && ln -sfn "$DIR_FINALE/bin/prosit-api" "$PGRST_DIR/prosit-api" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  installa)
+    cartelle; controlli; segreti; database; config_modulo; applica; unita_systemd
+    collega_comando
+    if [ "$PREP" = 1 ]; then
+      prova_postgrest
+      script_admin
+      ( lizmap ) || avviso "modulo Lizmap non installato ora: dopo l'amministratore lanciare '$DIR_FINALE/bin/prosit-api lizmap'"
+      verifica
+      cat <<FINE
+
+Fatto tutto quello che si puo' fare senza root. Ultimo passo, per l'amministratore (una volta):
+
+    sudo bash $CONF/per-amministratore.sh
+
+(lo script e' leggibile: conviene che lo guardi prima). Poi esci e rientra da SSH e lancia
+    $DIR_FINALE/bin/prosit-api verifica
+Infine in Lizmap -> Amministrazione -> Diritti: "Accesso alle API da programmi" al gruppo tecnici_api.
+FINE
+    else
+      if [ -f "/etc/systemd/system/$SERVIZIO.service" ]; then
+        # unita' gia' installate dall'amministratore: postgrest-prosit-api.path avvia PostgREST
+        # appena trova la configurazione appena scritta
+        info "Attendo l'avvio di PostgREST da parte di systemd"
+        for i in $(seq 1 20); do pronto && break; sleep 1; done
+      fi
+      lizmap; verifica || true
+      pronto || istruzioni_admin
+      cat <<FINE
+
+Ultimi passi (vedi README):
+ 1. Se PostgREST non e' ancora attivo: inviare all'amministratore le istruzioni qui sopra
+    (si rivedono con 'prosit-api systemd'), poi 'prosit-api verifica'.
+ 2. Lizmap -> Amministrazione -> Diritti: assegnare "Accesso alle API da programmi"
+    SOLO al gruppo degli utenti tecnici (es. "tecnici_api").
+ 3. Prova: $LIZMAP_URL/api.php/prosit/v2/status  e, collegati a Lizmap, .../auth/me
+FINE
+    fi
+    ;;
+  applica) applica; verifica ;;
+  applica-db) applica ;;          # solo database (usato da per-amministratore.sh, prima del servizio)
+  lizmap) lizmap ;;
+  utenti-pg) utenti_pg ;;
+  utenti-sqlite) utenti_sqlite ;;
+  rimuovi-modulo) rimuovi_modulo ;;
+  verifica) verifica ;;
+  systemd) binario_postgrest >/dev/null; unita_systemd; istruzioni_admin ;;
+  postgrest) shift; pgrst "$@" ;;
+  manutenzione) backup; pulizia ;;
+  backup) backup ;;
+  ruota-jwt) ruota_jwt ;;
+  pulizia) shift; pulizia "$@" ;;
+  *) sed -n '3,31p' "$0"; exit 2 ;;
+esac

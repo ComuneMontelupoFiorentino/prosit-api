@@ -1,0 +1,244 @@
+# =============================================================================
+# PROSIT API v2 — configurazione unica di AUTENTICAZIONE e CHIAMATE
+# =============================================================================
+# Da questo file bin/genera_api.py produce:
+#   sql/generato/50_risorse.sql   gruppi, database esterni, viste e GRANT in PostgreSQL
+#   postgrest/prosit-api.conf     configurazione di PostgREST
+#   openapi/prosit-api-v2.yaml    contratto OpenAPI 3 (con le colonne reali se il database e' raggiungibile)
+#
+# Dopo una modifica:   /opt/prosit-api/bin/prosit-api applica
+#
+# NIENTE PASSWORD QUI: stanno in /etc/prosit-api/segreti.env.
+#
+# Autenticazione (non si configura qui: la fa Lizmap, modulo lizmap-module/prositapi):
+#   - browser: sessione di Lizmap;
+#   - programmi: HTTP Basic con un utente Lizmap che ha il diritto "prosit.api.programmi"
+#     (Lizmap -> Amministrazione -> Diritti). Consigliato: utenti tecnici dedicati.
+# =============================================================================
+
+versione: 2
+
+api:
+  # indirizzo pubblico: punto di ingresso "api" di Lizmap + prefisso del modulo
+  percorso: /lizmap/api.php/prosit/v2
+  server_pubblico: https://gis.comune.montelupo-fiorentino.fi.it   # per la documentazione OpenAPI
+  postgrest: http://127.0.0.1:3100        # PostgREST ascolta SOLO in locale
+  audience: prosit-api
+  righe_massime: 5000                     # per richiesta (PostgREST db-max-rows)
+
+# -----------------------------------------------------------------------------
+# GRUPPI: ruolo PostgreSQL grp_<nome>  <-  gruppi Lizmap (id o nome)
+# "utenti" e' predefinito: tutti gli utenti Lizmap autenticati.
+# -----------------------------------------------------------------------------
+gruppi:
+  admins:
+    lizmap: [admins]
+    descrizione: Amministratori
+  tvcc:
+    lizmap: [admins, vigili, ced]          # vigili = Polizia Municipale, ced = Servizi Informatici e Innovazione
+    descrizione: Registro controlli videosorveglianza
+  manutentori_verde:
+    lizmap: [man_verde_es, man_int]
+    descrizione: Manutentori del verde (esterni e interni)
+
+# -----------------------------------------------------------------------------
+# DATABASE ESTERNI (postgres_fdw). La password e' PW_<UTENTE> in segreti.env.
+# -----------------------------------------------------------------------------
+# Collegamenti ai database esterni (postgres_fdw). prosit_api_ro / prosit_api_rw li crea
+# l'installazione (sql/05_utenti_fdw.sql) con password generate: sono membri di prosit_ro /
+# prosit_rw, quindi hanno i loro permessi. Per altri utenti remoti: password in segreti.env
+# (riga PW_<UTENTE>=...).
+database:
+  segn:
+    dbname: segnalazioni_23
+    host: 127.0.0.1
+    port: 5432
+    utente_lettura: prosit_api_ro
+    utente_scrittura: prosit_api_rw
+    postgis: true
+  llpp:
+    dbname: llpp
+    host: 127.0.0.1
+    port: 5432
+    utente_lettura: prosit_api_ro
+    utente_scrittura: prosit_api_rw
+  vp:
+    dbname: vp
+    host: 127.0.0.1
+    port: 5432
+    utente_lettura: prosit_api_ro
+    utente_scrittura: prosit_api_rw
+  ip:
+    dbname: ip_2020_2022
+    host: 127.0.0.1
+    port: 5432
+    utente_lettura: prosit_api_ro
+    utente_scrittura: prosit_api_rw
+
+# -----------------------------------------------------------------------------
+# RISORSE: una per tabella/vista esterna -> GET/POST/PATCH/DELETE /<nome>
+#   sorgente      alias.schema.tabella (alias = chiave di "database")
+#   lettura | inserimento | modifica | cancellazione   gruppi abilitati
+#   scrivibili    colonne che il client puo' inviare in inserimento
+#   modificabili  colonne modificabili (predefinito = scrivibili)
+#   forzati       colonne riempite dal database: utente.login | utente.nome |
+#                 utente.email | adesso | oggi | {valore: ...}
+#   chiave        colonna identificativa (obbligatoria con modifica/cancellazione)
+#   colonne | escludi   colonne esposte (predefinito: tutte)
+#   filtro        condizione SQL sulle righe; puo' usare api_fn.login(),
+#                 api_fn.ha_ruolo('admins'), api_fn.in_gruppo_lizmap('man_int')
+# -----------------------------------------------------------------------------
+risorse:
+
+  # --- SEGNALAZIONI (db segnalazioni_23) ------------------------------------
+  segnalazioni:
+    descrizione: Segnalazioni (Rekla / Twproject / Prosit)
+    sorgente: segn.segn.segn_id
+    chiave: seg_id
+    escludi: [geom]
+    lettura: [utenti]
+  segnalazioni-cronologia:
+    descrizione: Aggiornamenti di stato della segnalazione (filtrare con id_prosit)
+    sorgente: segn.segn.reporting_ticket_deleted
+    lettura: [utenti]
+  segnalazioni-comunicazioni:
+    descrizione: Comunicazioni inviate per il ticket (filtrare con id_ticket)
+    sorgente: segn.audit.frontend_communication
+    lettura: [utenti]
+  todo:
+    descrizione: Attivita' (ToDo Twproject) collegate al ticket (filtrare con id_segn)
+    sorgente: segn.audit.todo_queue
+    lettura: [utenti]
+  segnalazioni-coordinate:
+    descrizione: Tema/oggetto dell'elemento segnalato (filtrare con ident)
+    sorgente: segn.segn.ident_coord
+    lettura: [utenti]
+  segnalazioni-allegati-rekla:
+    descrizione: Allegati Rekla (filtrare con seg_i_rek_n)
+    sorgente: segn.segn.rekla_doc
+    lettura: [utenti]
+  segnalazioni-allegati-twproject:
+    descrizione: Allegati Twproject (filtrare con id_ticket)
+    sorgente: segn.segn.issue_docs_attachment
+    lettura: [utenti]
+  assegnatari:
+    descrizione: Elenco assegnatari (man_es -> alias_name)
+    sorgente: segn.administration.assignee_list
+    lettura: [utenti]
+
+  # --- TICKET EDIFICI (BIT) ---------------------------------------------------
+  bit-ticket:
+    descrizione: Ticket edifici (vista completa)
+    sorgente: segn.buildings.list_tickets_full_all_v
+    chiave: id
+    lettura: [utenti]
+  bit-cronologia:
+    descrizione: Aggiornamenti ticket edifici (filtrare con id_ticket)
+    sorgente: segn.buildings.reporting_ticket
+    lettura: [utenti]
+  bit-allegati:
+    descrizione: Allegati ticket edifici (filtrare con id_ticket)
+    sorgente: segn.buildings.attached_docs_ticket
+    lettura: [utenti]
+
+  # --- VIDEOSORVEGLIANZA -----------------------------------------------------
+  tvcc-apparati:
+    descrizione: Telecamere con segnalazioni aperte
+    sorgente: segn.audit.list_tvcc_reported
+    chiave: id_app
+    lettura: [tvcc]
+  tvcc-ticket:
+    descrizione: Nuova segnalazione dal registro TVCC (vista con trigger di inserimento)
+    sorgente: segn.segn.insert_ticket_tvcc_rekla_v
+    inserimento: [tvcc]
+    scrivibili: [seg_o_ogg, seg_o_desc, segn_ogg_gen]
+    forzati:
+      seg_s_ac_op: utente.nome        # l'operatore lo decide il database, non il browser
+  tvcc-log:
+    descrizione: Registro giornaliero dei controlli
+    sorgente: segn.audit.daily_log_tvcc
+    chiave: id
+    lettura: [tvcc]
+    inserimento: [tvcc]
+    scrivibili: [note]
+    forzati:
+      insert_by: utente.nome
+
+  # --- MANOMISSIONI SUOLO PUBBLICO (db llpp) ---------------------------------
+  manomissioni:
+    descrizione: Scheda manomissione
+    sorgente: llpp.prog.manomissioni_sheet_v
+    chiave: id
+    lettura: [utenti]
+  manomissioni-allegati:
+    descrizione: Allegati della manomissione (filtrare con id_man)
+    sorgente: llpp.prog.manomissioni_attachs
+    lettura: [utenti]
+
+  # --- ILLUMINAZIONE PUBBLICA (db ip_2020_2022) ------------------------------
+  pali-luce:
+    descrizione: Scheda sostegno illuminazione
+    sorgente: ip.punti_luce.sheet_supporti_v
+    chiave: pl_id
+    lettura: [utenti]
+  pali-luce-interventi:
+    descrizione: Interventi/ispezioni sul sostegno (filtrare con pl_id)
+    sorgente: ip.manutenzioni.timeline_updates_v
+    lettura: [utenti]
+
+  # --- VERDE PUBBLICO (db vp) ------------------------------------------------
+  vp-tipi-intervento:
+    descrizione: Tipi di intervento per gruppo
+    sorgente: vp.interventi.join_int_user
+    lettura: [utenti]
+  vp-oggetti-manutentore:
+    descrizione: Zone/oggetti per manutentore e tipo
+    sorgente: vp.interventi.obj_mantainer_int
+    lettura: [utenti]
+
+  # --- ESEMPIO: CRUD completo con limite per riga ----------------------------
+  # interventi-verde:
+  #   descrizione: Interventi programmati sul verde
+  #   sorgente: vp.gestione.pian_int
+  #   chiave: id
+  #   lettura: [manutentori_verde, admins]
+  #   inserimento: [manutentori_verde, admins]
+  #   modifica: [manutentori_verde, admins]
+  #   cancellazione: [admins]
+  #   scrivibili: [id_zona, ty_int, date_int, execution, date_int_ex]
+  #   forzati:
+  #     planned_int: {valore: su Programmazione}
+  #   # i manutentori vedono e modificano solo i propri record; gli admins tutto
+  #   filtro: >-
+  #     api_fn.ha_ruolo('admins')
+  #     OR manteiner = CASE WHEN api_fn.in_gruppo_lizmap('man_verde_es') THEN 'Cooperativa orizzonti'
+  #                         WHEN api_fn.in_gruppo_lizmap('man_int') THEN 'Manutentori interni' END
+
+# Tabelle esterne usate solo dalle funzioni di sql/60_servizi.sql
+importa:
+  - segn.administration.login_rekla_prosit
+  - segn.audit.mail_queue
+  - vp.gestione.pian_int
+  - vp.gestione.pian_int_street
+
+# -----------------------------------------------------------------------------
+# SERVIZI con logica propria (funzioni RPC in sql/60_servizi.sql)
+# -----------------------------------------------------------------------------
+servizi:
+  calendario:          # api.calendario_* (sql/60_servizi.sql)
+    tab:
+      verde: vp.gestione.pian_int
+      strade: vp.gestione.pian_int_street
+    tipi_fonte:
+      potature siepi: verde
+      falciatura tappeti erbosi: verde
+      Pulizia Strade, Piazze, Parcheggi...: strade
+    planned_int: su Programmazione
+    editor_groups: [man_verde_es, man_int, admins]
+    group_manteiner:
+      man_verde_es: Cooperativa orizzonti
+      man_int: Manutentori interni
+      admins: Manutentori interni
+    admin_groups: [admins]
+    viewers: [man, urp]
+    data_groups: [man_verde_es, man_int]

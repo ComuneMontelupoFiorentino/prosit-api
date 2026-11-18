@@ -1,0 +1,51 @@
+# PostgREST per Prosit API v2 — generato da "prosit-api systemd"
+# Installazione (root): install -m 0644 questo_file /etc/systemd/system/
+#                       systemctl daemon-reload && systemctl enable --now postgrest-prosit-api
+[Unit]
+Description=PostgREST - Prosit API v2 (solo 127.0.0.1)
+Documentation=file://@RADICE@/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+# finche' "prosit-api installa" non ha scritto la configurazione il servizio non parte (senza errori):
+# lo avvia postgrest-prosit-api.path appena il file compare
+ConditionPathExists=@ETC@/postgrest.conf
+ConditionPathExists=@ETC@/postgrest.env
+
+[Service]
+Type=simple
+# utente di sistema temporaneo creato da systemd: nessun account da gestire, nessun privilegio
+DynamicUser=yes
+# PGRST_DB_URI (password di authenticator): letto da systemd, non dal servizio
+EnvironmentFile=@ETC@/postgrest.env
+ExecStart=@PGRST_BIN@ @ETC@/postgrest.conf
+# ricarica configurazione e chiave pubblica senza interruzioni
+# (prosit-api lo fa anche senza privilegi, con NOTIFY pgrst sul database)
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=always
+RestartSec=3
+
+# isolamento
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+UMask=0077
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

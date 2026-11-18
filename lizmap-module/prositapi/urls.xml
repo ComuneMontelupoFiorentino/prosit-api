@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Montato sul punto di ingresso "api" di Lizmap con prefisso /prosit (install/configure.php):
+     https://<server>/lizmap/api.php/prosit/v2/... -->
+<suburls xmlns="http://jelix.org/ns/suburls/1.0">
+    <url pathinfo="/v2/:percorso" action="v2:get">
+        <param name="percorso" regexp="[a-z][a-z0-9\-]{0,62}(/[a-z][a-z0-9\-]{0,62})?"/>
+    </url>
+</suburls>
