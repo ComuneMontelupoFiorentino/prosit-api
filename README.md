@@ -312,3 +312,8 @@ il Sistema Informativo Territoriale del Comune di Montelupo Fiorentino. Nel repo
 [prosit](https://github.com/ComuneMontelupoFiorentino/prosit) ci sono l'architettura, l'elenco
 di tutti i componenti (topic [`prosit`](https://github.com/search?q=org%3AComuneMontelupoFiorentino+topic%3Aprosit&type=repositories))
 e le versioni che funzionano insieme.
+
+## Licenza
+
+Rilasciato dal Comune di Montelupo Fiorentino con licenza [EUPL-1.2](LICENSE) (Licenza Pubblica dell'Unione Europea).
+La libreria firebase/php-jwt in `lib/php-jwt/` mantiene la propria licenza (BSD-3-Clause).
